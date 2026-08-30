@@ -47,3 +47,16 @@ public sealed record PairingOutcome(
     bool AlreadyPaired,
     string Location,
     bool VerifiedOnDisk);
+
+/// <summary>
+/// What was actually observed when launching content, as opposed to what was
+/// merely requested. Physical testing showed a launcher call being accepted
+/// while the TV stayed on the home screen, so "the TV did not say no" is not
+/// evidence of anything and is never reported as success.
+/// </summary>
+public sealed record LaunchEvidence(
+    bool DialEndpointFound,
+    bool DialLaunchAccepted,
+    bool ForegroundConfirmed,
+    string? ForegroundAppId,
+    double ElapsedSeconds);

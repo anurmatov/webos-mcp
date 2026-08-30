@@ -5,8 +5,9 @@ LG webOS TV over the local network — power, apps, browser, YouTube, inputs,
 media, navigation and notifications.
 
 Built on .NET 10. One shared tool layer is served over **stdio** (local MCP
-clients) and **Streamable HTTP** (container / network use), backed by the LG
-SSAP WebSocket protocol and Wake-on-LAN.
+clients) and **Streamable HTTP** (container / network use), backed by three
+protocols: the LG **SSAP** WebSocket for control, **Wake-on-LAN** for power-on,
+and **DIAL** for launching YouTube in a way that can actually be verified.
 
 - **Local-first.** Talks to the TV on your LAN. No cloud service, no account.
 - **Typed and validated.** Every tool takes a typed request and validates its
@@ -302,19 +303,31 @@ registered by default**. Every tool returns
 | `tv_launch_app` | Launch an app by id. |
 | `tv_close_app` | Close a running app. |
 | `tv_open_url` | Open an **HTTPS-only** URL in the webOS browser. |
-| `tv_youtube_search` | Search YouTube. Deep link, with a bounded fallback. |
-| `tv_youtube_play` | Play a video by id, `youtu.be` link or watch URL. |
+| `tv_youtube_play` | Play a video by id, `youtu.be` link or watch URL. Launches over **DIAL** and confirms YouTube reached the foreground before reporting success. |
+| `tv_youtube_search` | **Not supported** — always returns `TV_UNSUPPORTED_CAPABILITY`. See below. |
 
-Content tools report which path ran — `"path": "DeepLink"` or
-`"path": "Fallback"` — so a caller is never left guessing whether it got a
-stable deep link or a best-effort remote-control sequence.
+Content tools report which path ran — `"path": "DeepLink"` or `"path": "Dial"`.
+
+**`tv_youtube_play` never reports success on an accepted launch alone.** After
+the DIAL launch it polls the TV's own foreground-app report and only succeeds
+once YouTube actually appears. A launch the TV accepted but never acted on is
+reported as a failure, naming the app that was actually in the foreground.
+
+**`tv_youtube_search` is deliberately unsupported.** Physical testing showed
+YouTube's custom on-screen keyboard silently ignoring
+`ssap://com.webos.service.ime/insertText`: the call succeeded, nothing was
+typed, and the tool reported success while the TV sat on the home screen. DIAL
+carries a video id but has no documented search parameter, so there is nothing
+to verify a search against either. Rather than ship a tool that lies, it
+returns `TV_UNSUPPORTED_CAPABILITY` until a verifiable mechanism exists. Use
+`tv_youtube_play` with a video id.
 
 ### Navigation and input
 
 | Tool | Description |
 |---|---|
 | `tv_send_button` | Press a button from a fixed allowlist; `repeat` 1–20. |
-| `tv_type_text` | Type into the focused field; up to 512 characters. |
+| `tv_type_text` | Type into the focused field; up to 512 characters. Returns `TV_UNSUPPORTED_CAPABILITY` when the foreground app uses a custom on-screen keyboard (YouTube does) rather than typing nothing and claiming success. |
 | `tv_delete_characters` | Delete 1–20 characters. |
 | `tv_send_enter` | Send Enter. |
 | `tv_pointer_move` | Move the pointer; each axis bounded to ±500. |
@@ -451,6 +464,11 @@ something actually needs it, and keep the HTTP bearer token tight when it is on.
 
 ### Verification, not optimism
 
+This applies to content launching too, and it was learned the hard way: the
+first implementation treated SSAP launcher acceptance as playback, and physical
+testing found it reporting success with the TV still on its home screen.
+`tv_youtube_play` now confirms the foreground app before succeeding.
+
 `tv_power_on` never reports success merely because a packet was sent. It polls
 for an Active state and returns `"verified": true` only if it observed one;
 otherwise it returns `"verified": false` with an explicit `UNVERIFIED`
@@ -470,8 +488,8 @@ explanation. A sent packet is not a woken TV.
 
 ## Compatibility statement
 
-Only behaviour built on stable, documented SSAP and Wake-on-LAN calls is
-claimed as supported. Capability varies by model, firmware and current input —
+Only behaviour built on stable, documented **SSAP**, **Wake-on-LAN** and
+**DIAL** calls is claimed as supported. Capability varies by model, firmware and current input —
 the server reports `TV_UNSUPPORTED_CAPABILITY` rather than guessing or
 silently doing nothing.
 
@@ -481,9 +499,12 @@ Specifically **not** claimed:
   It is explicitly best-effort.
 - That channel tools work on every model or input. They need tuner support.
 - That `tv_screen_off` / `tv_screen_on` exist on every model.
-- That any particular app's deep link is stable. Where a deep link is
-  rejected, the content tools fall back to a bounded remote-control sequence
-  and label the result `Fallback`.
+- That every TV exposes a DIAL endpoint. Where it does not, `tv_youtube_play`
+  reports `TV_UNSUPPORTED_CAPABILITY` rather than falling back to something
+  unverifiable.
+- That text entry reaches every app. Apps with custom on-screen keyboards
+  ignore standard SSAP text entry, and `tv_type_text` refuses for those rather
+  than reporting a no-op as success.
 
 The automated suite runs entirely against fakes, so it verifies this server's
 logic — mapping, validation, error selection, serialization, reconnect,

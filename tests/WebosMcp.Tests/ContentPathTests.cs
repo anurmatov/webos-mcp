@@ -1,4 +1,5 @@
 using System.Text.Json;
+using WebosMcp.Application;
 using WebosMcp.Domain;
 using WebosMcp.Tests.Fakes;
 using Xunit;
@@ -6,11 +7,27 @@ using Xunit;
 namespace WebosMcp.Tests;
 
 /// <summary>
-/// Deep-link versus bounded fallback. The label the tool returns must match the
-/// path that actually ran — a caller is never left guessing.
+/// Content launching, after physical testing showed the old implementation
+/// reporting success while the TV sat on the home screen. The rule these
+/// tests enforce: an accepted launch is not playback, and nothing is reported
+/// as success without an observed post-condition.
 /// </summary>
 public sealed class ContentPathTests
 {
+    /// <summary>Makes the TV report YouTube as the foreground app.</summary>
+    private static void ForegroundIsYouTube(FakeSsapConnection connection) =>
+        connection.Respond(
+            "ssap://com.webos.applicationManager/getForegroundAppInfo",
+            """{"returnValue":true,"appId":"youtube.leanback.v4"}""");
+
+    /// <summary>Makes the TV report it is sitting on the home screen.</summary>
+    private static void ForegroundIsHome(FakeSsapConnection connection) =>
+        connection.Respond(
+            "ssap://com.webos.applicationManager/getForegroundAppInfo",
+            """{"returnValue":true,"appId":"com.webos.app.home"}""");
+
+    // ------------------------------------------------------------- open url
+
     [Fact]
     public async Task Open_url_uses_the_direct_launcher_deep_link()
     {
@@ -25,92 +42,221 @@ public sealed class ContentPathTests
         Assert.Equal("https://example.com/page", payload.RootElement.GetProperty("target").GetString());
     }
 
-    [Fact]
-    public async Task Youtube_search_uses_the_deep_link_when_the_tv_accepts_it()
-    {
-        var harness = new TestHarness();
-
-        var result = await harness.Control.SearchYouTubeAsync("cooking pasta", CancellationToken.None);
-
-        Assert.Equal(ActionPath.DeepLink, result.Path);
-
-        var call = harness.Connection.Calls.Single(c => c.Target == "ssap://system.launcher/launch");
-        using var payload = JsonDocument.Parse(call.Payload!);
-        var target = payload.RootElement.GetProperty("contentTarget").GetString();
-        Assert.Contains("cooking%20pasta", target);
-
-        // No fallback sequence ran.
-        Assert.DoesNotContain(harness.Connection.Calls, c => c.Kind == "button");
-    }
+    // -------------------------------------------------------- youtube play
 
     [Fact]
-    public async Task Youtube_search_falls_back_to_a_bounded_sequence_and_says_so()
+    public async Task Play_launches_over_dial_and_confirms_the_app_reached_the_foreground()
     {
         var connection = new FakeSsapConnection();
-
-        // The deep-linked launch is rejected once; the plain launch then succeeds.
-        connection.TransientFailures["ssap://system.launcher/launch"] =
-            new Queue<Exception>([new TvException(TvErrorCode.TvError, "invalid contentTarget")]);
-
+        ForegroundIsYouTube(connection);
         var harness = new TestHarness(connection);
-        var result = await harness.Control.SearchYouTubeAsync("weather", CancellationToken.None);
 
-        Assert.Equal(ActionPath.Fallback, result.Path);
-        Assert.Contains("bounded", result.Detail, StringComparison.OrdinalIgnoreCase);
+        var result = await harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None);
 
-        // The fallback is a fixed, bounded sequence: launch, focus, type, submit.
-        Assert.Contains(harness.Connection.Calls, c => c.Kind == "button" && c.Target == "HOME");
-        Assert.Contains("ssap://com.webos.service.ime/insertText", harness.Connection.RequestUris);
-        Assert.Contains("ssap://com.webos.service.ime/sendEnterKey", harness.Connection.RequestUris);
+        Assert.Equal(ActionPath.Dial, result.Path);
+        Assert.Equal(1, harness.Dial.LaunchCount);
+        Assert.Equal(["v=dQw4w9WgXcQ"], harness.Dial.LaunchPayloads);
 
-        var typed = harness.Connection.Calls
-            .First(c => c.Target == "ssap://com.webos.service.ime/insertText");
-        using var payload = JsonDocument.Parse(typed.Payload!);
-        Assert.Equal("weather", payload.RootElement.GetProperty("text").GetString());
+        // The success message names the evidence, not just the request.
+        Assert.Contains("confirmed", result.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("foreground", result.Detail, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public async Task The_fallback_sequence_is_bounded_not_a_retry_loop()
+    public async Task Play_accepts_a_full_url_and_launches_the_bare_video_id()
     {
         var connection = new FakeSsapConnection();
-        connection.TransientFailures["ssap://system.launcher/launch"] =
-            new Queue<Exception>([new TvException(TvErrorCode.TvError, "invalid contentTarget")]);
-
+        ForegroundIsYouTube(connection);
         var harness = new TestHarness(connection);
-        await harness.Control.SearchYouTubeAsync("weather", CancellationToken.None);
 
-        // Two launches total: the rejected deep link, then the fallback's plain launch.
-        Assert.Equal(2, harness.Connection.Calls.Count(c => c.Target == "ssap://system.launcher/launch"));
-        Assert.Single(harness.Connection.Calls, c => c.Kind == "button");
-    }
-
-    [Fact]
-    public async Task Youtube_play_deep_links_the_bare_video_id()
-    {
-        var harness = new TestHarness();
-
-        var result = await harness.Control.PlayYouTubeAsync(
+        await harness.Control.PlayYouTubeAsync(
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ", CancellationToken.None);
 
-        Assert.Equal(ActionPath.DeepLink, result.Path);
-
-        var call = harness.Connection.Calls.Single(c => c.Target == "ssap://system.launcher/launch");
-        using var payload = JsonDocument.Parse(call.Payload!);
-        Assert.Equal(
-            "https://www.youtube.com/tv?v=dQw4w9WgXcQ",
-            payload.RootElement.GetProperty("contentTarget").GetString());
+        Assert.Equal(["v=dQw4w9WgXcQ"], harness.Dial.LaunchPayloads);
     }
 
     [Fact]
-    public async Task A_pairing_failure_during_search_is_not_swallowed_by_the_fallback()
+    public async Task Play_NEVER_reports_success_when_the_tv_stays_on_home()
     {
-        var connection = new FakeSsapConnection { RegisterFailure = TvException.PairingRequired() };
+        // The exact defect physical testing found: DIAL accepts the launch,
+        // the TV does not switch app, and the old code called that success.
+        var connection = new FakeSsapConnection();
+        ForegroundIsHome(connection);
         var harness = new TestHarness(connection);
 
         var ex = await Assert.ThrowsAsync<TvException>(
-            () => harness.Control.SearchYouTubeAsync("weather", CancellationToken.None));
+            () => harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None));
 
-        // The fallback exists for deep-link rejection, not for masking the error contract.
-        Assert.Equal(TvErrorCode.PairingRequired, ex.Code);
+        Assert.Equal(TvErrorCode.TvError, ex.Code);
+        Assert.Contains("did not reach the foreground", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // It really did try — this is a verification failure, not a skipped launch.
+        Assert.Equal(1, harness.Dial.LaunchCount);
+    }
+
+    [Fact]
+    public async Task Play_returns_UNSUPPORTED_when_the_tv_has_no_dial_endpoint()
+    {
+        var harness = new TestHarness();
+        harness.Dial.ApplicationUrl = null;
+
+        var ex = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvUnsupportedCapability, ex.Code);
+        Assert.Equal("TV_UNSUPPORTED_CAPABILITY", ex.Code.ToWireCode());
+        Assert.Equal(0, harness.Dial.LaunchCount);
+    }
+
+    [Fact]
+    public async Task Play_returns_UNSUPPORTED_when_youtube_is_not_installed()
+    {
+        var harness = new TestHarness();
+        harness.Dial.AppStatus = null;   // DIAL answers 404 for a missing app
+
+        var ex = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvUnsupportedCapability, ex.Code);
+        Assert.Equal(0, harness.Dial.LaunchCount);
+    }
+
+    [Fact]
+    public async Task Play_returns_UNSUPPORTED_when_the_app_is_only_installable()
+    {
+        var harness = new TestHarness();
+        harness.Dial.AppStatus = new DialAppStatus("YouTube", "installable=https://example.com", Installed: false);
+
+        var ex = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvUnsupportedCapability, ex.Code);
+    }
+
+    [Fact]
+    public async Task Play_reports_failure_when_the_tv_rejects_the_dial_launch()
+    {
+        var harness = new TestHarness();
+        harness.Dial.LaunchAccepted = false;
+
+        var ex = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvError, ex.Code);
+        Assert.Contains("rejected", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Play_does_not_use_the_ssap_launcher_at_all()
+    {
+        var connection = new FakeSsapConnection();
+        ForegroundIsYouTube(connection);
+        var harness = new TestHarness(connection);
+
+        await harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None);
+
+        // The SSAP launcher is what produced the false success; the only SSAP
+        // traffic here should be the foreground-app confirmation.
+        Assert.DoesNotContain("ssap://system.launcher/launch", harness.Connection.RequestUris);
+        Assert.Contains(
+            "ssap://com.webos.applicationManager/getForegroundAppInfo", harness.Connection.RequestUris);
+    }
+
+    [Fact]
+    public async Task Play_rejects_a_malformed_video_reference_before_touching_dial()
+    {
+        // Note: a bare 11-character string is a VALID id by shape, hyphens and
+        // all — so an invalid case has to be something the pattern really
+        // rejects, such as a non-YouTube host.
+        var harness = new TestHarness();
+
+        var ex = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync("https://example.com/watch?v=dQw4w9WgXcQ", CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.InvalidInput, ex.Code);
+        Assert.Equal(0, harness.Dial.ResolveCount);
+    }
+
+    [Fact]
+    public async Task Foreground_confirmation_is_bounded_and_does_not_spin()
+    {
+        var connection = new FakeSsapConnection();
+        ForegroundIsHome(connection);
+        var harness = new TestHarness(connection, o =>
+        {
+            o.LaunchVerifyTimeoutSeconds = 6;
+            o.LaunchPollIntervalSeconds = 2;
+        });
+
+        await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None));
+
+        // 6s budget at a 2s interval is three polls.
+        Assert.Equal(3, harness.Delay.Count);
+    }
+
+    // ------------------------------------------------------ youtube search
+
+    [Fact]
+    public async Task Search_reports_UNSUPPORTED_rather_than_a_fake_success()
+    {
+        var harness = new TestHarness();
+
+        var ex = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.SearchYouTubeAsync("cooking pasta", CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvUnsupportedCapability, ex.Code);
+        Assert.Contains("keyboard", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // The removed fallback must not come back: nothing was typed, no
+        // button was pressed, and no app was launched.
+        Assert.Empty(harness.Connection.Calls);
+        Assert.Equal(0, harness.Dial.LaunchCount);
+    }
+
+    [Fact]
+    public async Task Search_still_validates_its_input()
+    {
+        var harness = new TestHarness();
+
+        var ex = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.SearchYouTubeAsync("   ", CancellationToken.None));
+
+        // A bad query is bad input, not "unsupported" — the two must not blur.
+        Assert.Equal(TvErrorCode.InvalidInput, ex.Code);
+    }
+
+    // ------------------------------------------------- custom keyboard apps
+
+    [Fact]
+    public async Task Type_text_refuses_when_a_custom_keyboard_app_is_in_the_foreground()
+    {
+        var connection = new FakeSsapConnection();
+        ForegroundIsYouTube(connection);
+        var harness = new TestHarness(connection);
+
+        var ex = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.TypeTextAsync("pasta", false, true, CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvUnsupportedCapability, ex.Code);
+        Assert.Contains("custom on-screen keyboard", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // Crucially: it did NOT type and then claim success.
+        Assert.DoesNotContain("ssap://com.webos.service.ime/insertText", harness.Connection.RequestUris);
+    }
+
+    [Fact]
+    public async Task Type_text_still_works_in_an_ordinary_app()
+    {
+        var connection = new FakeSsapConnection();
+        connection.Respond(
+            "ssap://com.webos.applicationManager/getForegroundAppInfo",
+            """{"returnValue":true,"appId":"com.webos.app.browser"}""");
+        var harness = new TestHarness(connection);
+
+        await harness.Control.TypeTextAsync("hello", false, true, CancellationToken.None);
+
+        Assert.Contains("ssap://com.webos.service.ime/insertText", harness.Connection.RequestUris);
+        Assert.Contains("ssap://com.webos.service.ime/sendEnterKey", harness.Connection.RequestUris);
     }
 }

@@ -25,6 +25,8 @@ public sealed class TestHarness
             PowerOnVerifyTimeoutSeconds = 12,
             PowerOnPollIntervalSeconds = 3,
             FallbackStepDelayMilliseconds = 0,
+            LaunchVerifyTimeoutSeconds = 6,
+            LaunchPollIntervalSeconds = 2,
         };
 
         configure?.Invoke(Options);
@@ -33,11 +35,13 @@ public sealed class TestHarness
         KeyStore = new FakeClientKeyStore();
         Wol = new FakeWolSender();
         Delay = new InstantDelayProvider();
+        Dial = new FakeDialClient();
 
         var wrapped = Microsoft.Extensions.Options.Options.Create(Options);
 
         Session = new TvSession(Factory, KeyStore, wrapped, LoggerFactory.CreateLogger<TvSession>());
-        Control = new TvControlService(Session, Delay, wrapped, LoggerFactory.CreateLogger<TvControlService>());
+        Control = new TvControlService(
+            Session, Delay, Dial, wrapped, LoggerFactory.CreateLogger<TvControlService>());
         Power = new PowerService(Wol, Control, Delay, wrapped, LoggerFactory.CreateLogger<PowerService>());
     }
 
@@ -52,6 +56,8 @@ public sealed class TestHarness
     public FakeWolSender Wol { get; }
 
     public InstantDelayProvider Delay { get; }
+
+    public FakeDialClient Dial { get; }
 
     public ILoggerFactory LoggerFactory { get; }
 

@@ -13,22 +13,38 @@ public sealed record ContentActionResult(ActionPath Path, string Detail, string?
 /// </summary>
 public sealed class TvControlService
 {
-    private const string YouTubeAppId = "youtube.leanback.v4";
     private const string BrowserAppId = "com.webos.app.browser";
+
+    /// <summary>The DIAL application name YouTube registers as.</summary>
+    private const string DialYouTubeApp = "YouTube";
+
+    /// <summary>Matched against the TV's reported foreground app id.</summary>
+    private const string YouTubeAppIdFragment = "youtube";
+
+    /// <summary>
+    /// Apps whose on-screen keyboard silently swallows standard SSAP text
+    /// entry. Physical testing confirmed YouTube does: insertText succeeds and
+    /// nothing is typed. Reporting success for that is a lie, so text entry
+    /// refuses outright when one of these is in the foreground.
+    /// </summary>
+    private static readonly string[] CustomKeyboardApps = ["youtube"];
 
     private readonly ITvSession _session;
     private readonly IDelayProvider _delay;
+    private readonly IDialClient _dial;
     private readonly WebosMcpOptions _options;
     private readonly ILogger<TvControlService> _logger;
 
     public TvControlService(
         ITvSession session,
         IDelayProvider delay,
+        IDialClient dial,
         IOptions<WebosMcpOptions> options,
         ILogger<TvControlService> logger)
     {
         _session = session;
         _delay = delay;
+        _dial = dial;
         _options = options.Value;
         _logger = logger;
     }
@@ -267,87 +283,145 @@ public sealed class TvControlService
     }
 
     /// <summary>
-    /// Prefers the YouTube TV deep link. Falls back to launching the app and
-    /// driving its search field via a bounded text-entry sequence, and the
-    /// result always states which path ran.
+    /// YouTube search has NO verifiable mechanism on this TV.
+    ///
+    /// The previous implementation launched YouTube and typed the query with
+    /// ssap://com.webos.service.ime/insertText. Physical testing showed that
+    /// YouTube's custom on-screen keyboard silently ignores that input: the
+    /// call succeeds, nothing is typed, and the tool reported success while
+    /// the TV sat on the home screen. The bounded fallback has therefore been
+    /// removed rather than repaired — it could not be made honest.
+    ///
+    /// DIAL carries a video id but has no documented search parameter, so
+    /// there is nothing to verify a search against either. Until a genuinely
+    /// verifiable path exists this reports unsupported, which is the truthful
+    /// answer.
     /// </summary>
-    public async Task<ContentActionResult> SearchYouTubeAsync(string query, CancellationToken ct)
+    public Task<ContentActionResult> SearchYouTubeAsync(string query, CancellationToken ct)
     {
-        var validated = InputValidation.ValidateSearchQuery(query);
-        var target = $"https://www.youtube.com/tv?va=1#/search?q={Uri.EscapeDataString(validated)}";
+        // Still validated, so a malformed query is rejected as bad input
+        // rather than masked by the unsupported response.
+        InputValidation.ValidateSearchQuery(query);
 
-        try
-        {
-            return await _session.ExecuteAsync("youtube_search", async (connection, token) =>
-            {
-                await connection.RequestAsync(
-                    SsapUri.LaunchApp,
-                    new { id = YouTubeAppId, contentTarget = target },
-                    token).ConfigureAwait(false);
-
-                return new ContentActionResult(
-                    ActionPath.DeepLink,
-                    $"Launched YouTube with a search deep link for '{validated}'.",
-                    YouTubeAppId);
-            }, ct).ConfigureAwait(false);
-        }
-        catch (TvException ex) when (IsDeepLinkRejection(ex))
-        {
-            _logger.LogInformation(
-                "YouTube search deep link was rejected ({Code}); using the bounded fallback sequence.",
-                ex.Code.ToWireCode());
-
-            return await SearchYouTubeFallbackAsync(validated, ct).ConfigureAwait(false);
-        }
+        throw new TvException(
+            TvErrorCode.TvUnsupportedCapability,
+            "Searching YouTube on the TV is not supported. YouTube's custom on-screen keyboard ignores " +
+            "standard text entry, and DIAL exposes no search parameter, so there is no way to confirm a " +
+            "search actually ran. Use tv_youtube_play with a video id or URL instead.");
     }
 
-    private async Task<ContentActionResult> SearchYouTubeFallbackAsync(string query, CancellationToken ct)
-    {
-        await _session.ExecuteAsync("youtube_search_fallback", async (connection, token) =>
-        {
-            // Bounded, fixed-length sequence: launch, focus search, type, submit.
-            await connection.RequestAsync(SsapUri.LaunchApp, new { id = YouTubeAppId }, token).ConfigureAwait(false);
-            await StepDelayAsync(token).ConfigureAwait(false);
-
-            await connection.SendButtonAsync(RemoteButton.Home.ToWireName(), token).ConfigureAwait(false);
-            await StepDelayAsync(token).ConfigureAwait(false);
-
-            await connection.RequestAsync(
-                SsapUri.InsertText,
-                new { text = query, replace = true },
-                token).ConfigureAwait(false);
-            await StepDelayAsync(token).ConfigureAwait(false);
-
-            await connection.RequestAsync(SsapUri.SendEnterKey, null, token).ConfigureAwait(false);
-        }, ct).ConfigureAwait(false);
-
-        return new ContentActionResult(
-            ActionPath.Fallback,
-            $"YouTube had no usable search deep link, so a bounded remote-control and text-entry sequence was used for '{query}'.",
-            YouTubeAppId);
-    }
-
+    /// <summary>
+    /// Plays a YouTube video via DIAL, and reports success ONLY after
+    /// observing YouTube actually reach the foreground.
+    ///
+    /// SSAP's launcher is deliberately not used here: physical testing showed
+    /// it accepting the request and returning success while the TV stayed on
+    /// the home screen. A launch that is merely accepted is not playback.
+    /// </summary>
     public async Task<ContentActionResult> PlayYouTubeAsync(string videoOrUrl, CancellationToken ct)
     {
         var videoId = InputValidation.ValidateYouTubeVideoId(videoOrUrl);
-        var target = $"https://www.youtube.com/tv?v={videoId}";
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
 
-        return await _session.ExecuteAsync("youtube_play", async (connection, token) =>
+        var applicationUrl = await _dial.ResolveApplicationUrlAsync(ct).ConfigureAwait(false);
+        if (applicationUrl is null)
         {
-            await connection.RequestAsync(
-                SsapUri.LaunchApp,
-                new { id = YouTubeAppId, contentTarget = target },
-                token).ConfigureAwait(false);
+            throw new TvException(
+                TvErrorCode.TvUnsupportedCapability,
+                "This TV exposes no DIAL endpoint, so a YouTube launch cannot be performed or confirmed. " +
+                "DIAL is normally advertised over SSDP on the local segment; check the TV is on the same " +
+                "segment and that network control is enabled.");
+        }
 
-            return new ContentActionResult(
-                ActionPath.DeepLink,
-                $"Launched YouTube with a video deep link for '{videoId}'.",
-                YouTubeAppId);
-        }, ct).ConfigureAwait(false);
+        var status = await _dial.GetAppStatusAsync(applicationUrl, DialYouTubeApp, ct).ConfigureAwait(false);
+        if (status is null || !status.Installed)
+        {
+            throw TvException.Unsupported("the YouTube DIAL application (it is not installed on this TV)");
+        }
+
+        var accepted = await _dial.LaunchAppAsync(
+            applicationUrl, DialYouTubeApp, $"v={Uri.EscapeDataString(videoId)}", ct).ConfigureAwait(false);
+
+        if (!accepted)
+        {
+            throw new TvException(
+                TvErrorCode.TvError,
+                $"The TV rejected the DIAL launch request for video '{videoId}'.");
+        }
+
+        // Acceptance is not evidence. Confirm from the TV's own foreground-app
+        // report before calling this a success.
+        var evidence = await ConfirmForegroundAsync(
+            YouTubeAppIdFragment,
+            dialEndpointFound: true,
+            dialLaunchAccepted: true,
+            started,
+            ct).ConfigureAwait(false);
+
+        if (!evidence.ForegroundConfirmed)
+        {
+            throw new TvException(
+                TvErrorCode.TvError,
+                $"The DIAL launch for video '{videoId}' was accepted, but YouTube did not reach the " +
+                $"foreground within {_options.LaunchVerifyTimeoutSeconds}s " +
+                $"(foreground app was '{evidence.ForegroundAppId ?? "unknown"}'). " +
+                "Reporting failure rather than an unverified success.");
+        }
+
+        return new ContentActionResult(
+            ActionPath.Dial,
+            $"Launched video '{videoId}' over DIAL and confirmed YouTube reached the foreground " +
+            $"(app '{evidence.ForegroundAppId}') after {evidence.ElapsedSeconds:0.0}s.",
+            evidence.ForegroundAppId);
     }
 
-    private static bool IsDeepLinkRejection(TvException ex) =>
-        ex.Code is TvErrorCode.TvError or TvErrorCode.TvUnsupportedCapability;
+    /// <summary>
+    /// Polls the TV's own foreground-app report until it names the expected
+    /// app or the budget expires. Bounded by an attempt count as well as
+    /// wall-clock so it is deterministic under a fake delay provider.
+    /// </summary>
+    private async Task<LaunchEvidence> ConfirmForegroundAsync(
+        string expectedAppFragment,
+        bool dialEndpointFound,
+        bool dialLaunchAccepted,
+        long started,
+        CancellationToken ct)
+    {
+        var interval = TimeSpan.FromSeconds(Math.Max(1, _options.LaunchPollIntervalSeconds));
+        var budget = TimeSpan.FromSeconds(Math.Max(1, _options.LaunchVerifyTimeoutSeconds));
+        var maxAttempts = (int)Math.Ceiling(budget.TotalSeconds / interval.TotalSeconds);
+
+        string? appId = null;
+
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            try
+            {
+                appId = (await GetForegroundAppAsync(ct).ConfigureAwait(false)).AppId;
+            }
+            catch (TvException)
+            {
+                // The TV can briefly refuse while an app is starting. Keep
+                // polling; the budget still bounds us.
+                appId = null;
+            }
+
+            if (appId is not null &&
+                appId.Contains(expectedAppFragment, StringComparison.OrdinalIgnoreCase))
+            {
+                return new LaunchEvidence(
+                    dialEndpointFound, dialLaunchAccepted, true, appId, Elapsed(started));
+            }
+
+            await _delay.DelayAsync(interval, ct).ConfigureAwait(false);
+        }
+
+        return new LaunchEvidence(
+            dialEndpointFound, dialLaunchAccepted, false, appId, Elapsed(started));
+    }
+
+    private static double Elapsed(long started) =>
+        System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds;
 
     // ------------------------------------------------------------ navigation
 
@@ -371,11 +445,25 @@ public sealed class TvControlService
         }, ct);
     }
 
-    public Task TypeTextAsync(string text, bool replace, bool submit, CancellationToken ct)
+    public async Task TypeTextAsync(string text, bool replace, bool submit, CancellationToken ct)
     {
         var validated = InputValidation.ValidateText(text);
 
-        return _session.ExecuteAsync("type_text", async (connection, token) =>
+        // Refuse rather than no-op. The SSAP call would succeed and type
+        // nothing, which is exactly the false success this tool must not
+        // produce.
+        var foreground = await GetForegroundAppAsync(ct).ConfigureAwait(false);
+        if (foreground.AppId is { } appId &&
+            CustomKeyboardApps.Any(a => appId.Contains(a, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new TvException(
+                TvErrorCode.TvUnsupportedCapability,
+                $"'{appId}' uses a custom on-screen keyboard that ignores standard text entry, so typing " +
+                "into it would silently do nothing. Use the remote-control buttons (tv_send_button) to drive " +
+                "its keyboard, or tv_youtube_play to open a video directly.");
+        }
+
+        await _session.ExecuteAsync("type_text", async (connection, token) =>
         {
             await connection.RequestAsync(
                 SsapUri.InsertText,
@@ -387,7 +475,7 @@ public sealed class TvControlService
                 await StepDelayAsync(token).ConfigureAwait(false);
                 await connection.RequestAsync(SsapUri.SendEnterKey, null, token).ConfigureAwait(false);
             }
-        }, ct);
+        }, ct).ConfigureAwait(false);
     }
 
     public Task DeleteCharactersAsync(int count, CancellationToken ct)

@@ -46,8 +46,9 @@ public sealed class AppTools
 
     [McpServerTool(Name = "tv_youtube_search")]
     [Description(
-        "Search YouTube on the TV. Prefers a deep link; falls back to a bounded remote-control and " +
-        "text-entry sequence when no deep link is available. The response states which path ran.")]
+        "NOT SUPPORTED on this TV, and returns TV_UNSUPPORTED_CAPABILITY. YouTube's custom on-screen " +
+        "keyboard ignores standard text entry and DIAL exposes no search parameter, so a search cannot be " +
+        "confirmed to have run. Use tv_youtube_play with a video id or URL instead.")]
     public Task<ToolResult> YouTubeSearch(
         [Description("Search query.")] string query,
         CancellationToken cancellationToken) =>
@@ -58,7 +59,11 @@ public sealed class AppTools
         });
 
     [McpServerTool(Name = "tv_youtube_play")]
-    [Description("Play a YouTube video by bare 11-character video id, youtu.be link or youtube.com watch URL.")]
+    [Description(
+        "Play a YouTube video by bare 11-character video id, youtu.be link or youtube.com watch URL. " +
+        "Launches over DIAL and reports success only after confirming YouTube reached the foreground — " +
+        "an accepted launch alone is never reported as success. Returns TV_UNSUPPORTED_CAPABILITY when " +
+        "the TV exposes no DIAL endpoint or YouTube is not installed.")]
     public Task<ToolResult> YouTubePlay(
         [Description("YouTube video id or URL.")] string video,
         CancellationToken cancellationToken) =>

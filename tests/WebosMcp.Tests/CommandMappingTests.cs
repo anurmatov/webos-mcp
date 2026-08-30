@@ -90,12 +90,23 @@ public sealed class CommandMappingTests
     [Fact]
     public async Task Type_text_with_submit_sends_insert_then_enter_in_order()
     {
-        var harness = new TestHarness();
+        var connection = new FakeSsapConnection();
+        var harness = new TestHarness(connection);
+
+        // Text entry first asks which app is in the foreground, so it can
+        // refuse rather than no-op against a custom on-screen keyboard.
+        connection.Respond(
+            "ssap://com.webos.applicationManager/getForegroundAppInfo",
+            """{"returnValue":true,"appId":"com.webos.app.browser"}""");
 
         await harness.Control.TypeTextAsync("kitchen", replace: true, submit: true, CancellationToken.None);
 
         Assert.Equal(
-            ["ssap://com.webos.service.ime/insertText", "ssap://com.webos.service.ime/sendEnterKey"],
+            [
+                "ssap://com.webos.applicationManager/getForegroundAppInfo",
+                "ssap://com.webos.service.ime/insertText",
+                "ssap://com.webos.service.ime/sendEnterKey",
+            ],
             harness.Connection.RequestUris);
 
         using var payload = JsonDocument.Parse(

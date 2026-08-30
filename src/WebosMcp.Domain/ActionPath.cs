@@ -10,6 +10,9 @@ public enum ActionPath
     /// <summary>A stable launch/deep-link parameter path was used.</summary>
     DeepLink,
 
-    /// <summary>A bounded remote-control / text-entry sequence was used instead.</summary>
-    Fallback,
+    /// <summary>
+    /// The DIAL protocol was used to launch the app, and the launch was
+    /// confirmed by observing the app actually reach the foreground.
+    /// </summary>
+    Dial,
 }

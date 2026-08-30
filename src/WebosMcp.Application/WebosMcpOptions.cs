@@ -55,6 +55,15 @@ public sealed class WebosMcpOptions
     public int PairingTimeoutSeconds { get; set; } = 60;
 
     public int ConnectTimeoutSeconds { get; set; } = 10;
+
+    /// <summary>
+    /// How long to wait for an app launched over DIAL to actually reach the
+    /// foreground. A launch that is accepted but never appears is a failure,
+    /// not a slow success.
+    /// </summary>
+    public int LaunchVerifyTimeoutSeconds { get; set; } = 20;
+
+    public int LaunchPollIntervalSeconds { get; set; } = 2;
     public int RequestTimeoutSeconds { get; set; } = 15;
 
     /// <summary>How long <c>power_on</c> polls for an Active state before returning an unverified result.</summary>

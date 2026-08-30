@@ -81,6 +81,41 @@ public interface IClientKeyStore
 
 public sealed record DiscoveredTv(string Address, string? FriendlyName, string? ModelName);
 
+/// <summary>State of a DIAL application on the TV.</summary>
+public sealed record DialAppStatus(string Name, string State, bool Installed)
+{
+    public bool IsRunning => State.Equals("running", StringComparison.OrdinalIgnoreCase)
+        || State.Equals("starting", StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// DIAL (DIscovery And Launch) — the third protocol this server speaks, after
+/// SSAP and Wake-on-LAN. It exists because SSAP's launcher accepts a YouTube
+/// launch request and returns success while the TV stays on the home screen;
+/// DIAL gives a launch that can actually be confirmed.
+/// </summary>
+public interface IDialClient
+{
+    /// <summary>
+    /// Resolves the TV's DIAL application URL, or null when the TV exposes no
+    /// DIAL endpoint (in which case the capability is genuinely unsupported).
+    /// </summary>
+    Task<Uri?> ResolveApplicationUrlAsync(CancellationToken cancellationToken);
+
+    /// <summary>Reads an application's DIAL status, or null when it is not installed.</summary>
+    Task<DialAppStatus?> GetAppStatusAsync(Uri applicationUrl, string app, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// POSTs a launch request. Returns true only when the TV accepted it
+    /// (2xx). Acceptance alone is NOT treated as success by callers.
+    /// </summary>
+    Task<bool> LaunchAppAsync(
+        Uri applicationUrl,
+        string app,
+        string payload,
+        CancellationToken cancellationToken);
+}
+
 public interface ITvDiscovery
 {
     Task<IReadOnlyList<DiscoveredTv>> DiscoverAsync(TimeSpan timeout, CancellationToken cancellationToken);

@@ -30,7 +30,10 @@ public sealed class NavigationTools
             () => _tv.SendButtonAsync(button, repeat, cancellationToken));
 
     [McpServerTool(Name = "tv_type_text")]
-    [Description("Type text into the field currently focused on the TV.")]
+    [Description(
+        "Type text into the field currently focused on the TV. Returns TV_UNSUPPORTED_CAPABILITY when the " +
+        "foreground app uses a custom on-screen keyboard that ignores standard text entry (YouTube does), " +
+        "rather than silently typing nothing and reporting success.")]
     public Task<ToolResult> TypeText(
         [Description("Text to type, up to 512 characters.")] string text,
         [Description("Replace the field's existing contents instead of appending.")] bool replace = false,

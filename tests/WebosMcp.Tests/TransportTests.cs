@@ -58,6 +58,9 @@ public sealed class TransportTests
         services.RemoveAll<IDelayProvider>();
         services.AddSingleton<IDelayProvider>(new InstantDelayProvider());
 
+        services.RemoveAll<IDialClient>();
+        services.AddSingleton<IDialClient>(new FakeDialClient());
+
         services.Configure<WebosMcpOptions>(options =>
         {
             options.Host = "192.0.2.10";

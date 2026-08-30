@@ -21,6 +21,14 @@ public static class ServiceRegistration
         services.AddSingleton<IWolSender, UdpWolSender>();
         services.AddSingleton<IClientKeyStore, FileClientKeyStore>();
         services.AddSingleton<ITvDiscovery, SsdpTvDiscovery>();
+
+        // DIAL is a third protocol alongside SSAP and WOL; it gets a plain
+        // HttpClient with a short timeout, since every call is LAN-local.
+        services.AddHttpClient<IDialClient, DialClient>(client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(10);
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("webos-mcp/1.0");
+        });
         services.AddSingleton<IDelayProvider, RealDelayProvider>();
 
         services.AddSingleton<ITvSession, TvSession>();
