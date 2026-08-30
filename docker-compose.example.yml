@@ -1,0 +1,56 @@
+# Example deployment. Copy to docker-compose.yml and edit.
+#
+# Every value below is a documentation-only placeholder. Replace the host and
+# MAC with your own, and supply the client key and HTTP token as real secrets —
+# never commit them.
+
+services:
+  webos-mcp:
+    build: .
+    image: webos-mcp:local
+    restart: unless-stopped
+
+    # Wake-on-LAN sends a broadcast, which does NOT reliably cross Docker's
+    # default bridge network out to the physical LAN. Host networking is the
+    # supported path for WOL: the broadcast leaves exactly as it would from a
+    # bare-metal process.
+    #
+    # If you must run in bridge mode, the server also sends a directed unicast
+    # magic packet to the TV's last-known address. That is best-effort and
+    # hardware-dependent — many routers forward it to a sleeping NIC, some do
+    # not. See the README's Limitations section.
+    network_mode: host
+
+    environment:
+      # --- TV connection -------------------------------------------------
+      WEBOSMCP__HOST: "192.0.2.10"
+      WEBOSMCP__PORT: "3000"
+      WEBOSMCP__MACADDRESS: "00:11:22:33:44:55"
+
+      # Set this to your subnet's broadcast address for the most reliable WOL.
+      WEBOSMCP__BROADCASTADDRESS: "192.0.2.255"
+
+      # --- Pairing -------------------------------------------------------
+      # Read the client key from a mounted secret rather than inlining it.
+      # Produce it once with: docker compose run --rm webos-mcp pair
+      WEBOSMCP__CLIENTKEYFILE: "/run/secrets/webos_client_key"
+
+      # --- HTTP transport ------------------------------------------------
+      # Loopback-only by default. To expose the transport beyond loopback you
+      # MUST also configure a token — the server refuses to start otherwise.
+      WEBOS_MCP_HTTP_BIND: "127.0.0.1"
+      WEBOS_MCP_HTTP_PORT: "8765"
+      WEBOS_MCP_HTTP_TOKEN_FILE: "/run/secrets/webos_http_token"
+
+    secrets:
+      - webos_client_key
+      - webos_http_token
+
+    # No `ports:` mapping. With network_mode: host the process binds directly,
+    # and the bind address above is what decides its reachability.
+
+secrets:
+  webos_client_key:
+    file: ./secrets/client_key        # gitignored; created by `webos-mcp pair`
+  webos_http_token:
+    file: ./secrets/http_token        # gitignored; e.g. `openssl rand -hex 32`

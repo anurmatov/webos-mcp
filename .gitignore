@@ -1,0 +1,14 @@
+bin/
+obj/
+*.user
+.vs/
+.idea/
+TestResults/
+artifacts/
+*.received.*
+
+# Local operator state — never commit
+clientkey.json
+*.clientkey.json
+.webos-mcp/
+.env
