@@ -296,4 +296,28 @@ public sealed class PairingTests
             "PAIRING_DENIED",
             payload.RootElement.GetProperty("error").GetProperty("code").GetString());
     }
+
+    [Fact]
+    public async Task Pair_device_refuses_on_its_own_account_if_registered_while_disabled()
+    {
+        // Registration is the real gate. This asserts the second, independent
+        // one: were the tool ever registered without the flag, it still
+        // refuses — and PAIRING_DISABLED is a reachable code rather than one
+        // documented but never thrown.
+        var connection = new FakeSsapConnection { IssuedClientKey = Secret };
+        var (service, store, _) = Build(connection);
+
+        var options = new WebosMcpOptions { Host = "192.0.2.10", EnablePairingTool = false };
+        var tools = new WebosMcp.Server.Tools.PairingTools(
+            service, Options.Create(options), NullLoggerFactory.Instance.CreateLogger<WebosMcp.Server.Tools.PairingTools>());
+
+        var result = await tools.PairDevice(force: false, CancellationToken.None);
+
+        Assert.False(result.Ok);
+        Assert.Equal("PAIRING_DISABLED", result.Error!.Code);
+
+        // Nothing reached the TV and nothing was written.
+        Assert.Equal(0, connection.RegisterCount);
+        Assert.Empty(store.Persists);
+    }
 }

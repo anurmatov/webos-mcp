@@ -375,7 +375,7 @@ The opt-in pairing tool adds four more, each distinguishable:
 
 | Code | Meaning |
 |---|---|
-| `PAIRING_DISABLED` | The pairing tool is not enabled on this deployment. |
+| `PAIRING_DISABLED` | The pairing tool is not enabled. Normally you will not see this: when disabled the tool is not registered at all, so a call fails as an unknown tool. It exists as a second, independent refusal in case the tool is ever registered without the flag. |
 | `PAIRING_DENIED` | A human actively declined the prompt on the TV. |
 | `PAIRING_TIMEOUT` | Nobody answered the prompt in time. |
 | `KEY_STORAGE_READONLY` | No durable writable key location is configured, or the write could not be made durable. |

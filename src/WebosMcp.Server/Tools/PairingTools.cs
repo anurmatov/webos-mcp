@@ -1,6 +1,9 @@
 using System.ComponentModel;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using ModelContextProtocol.Server;
+using WebosMcp.Application;
+using WebosMcp.Domain;
 using WebosMcp.Infrastructure;
 
 namespace WebosMcp.Server.Tools;
@@ -17,11 +20,16 @@ namespace WebosMcp.Server.Tools;
 public sealed class PairingTools
 {
     private readonly PairingService _pairing;
+    private readonly WebosMcpOptions _options;
     private readonly ILogger<PairingTools> _logger;
 
-    public PairingTools(PairingService pairing, ILogger<PairingTools> logger)
+    public PairingTools(
+        PairingService pairing,
+        IOptions<WebosMcpOptions> options,
+        ILogger<PairingTools> logger)
     {
         _pairing = pairing;
+        _options = options.Value;
         _logger = logger;
     }
 
@@ -36,6 +44,17 @@ public sealed class PairingTools
         CancellationToken cancellationToken = default) =>
         ToolInvoker.RunAsync(_logger, "pair_device", async () =>
         {
+            // Defence in depth. Registration is the real gate — this type is
+            // only added to the server when EnablePairingTool is true — but a
+            // future refactor that registered it unconditionally would silently
+            // reopen the boundary. Checking here means the tool refuses on its
+            // own account, and makes the documented PAIRING_DISABLED reachable
+            // rather than a code that can never occur.
+            if (!_options.EnablePairingTool)
+            {
+                throw TvException.PairingDisabled();
+            }
+
             var outcome = await _pairing.PairAsync(force, cancellationToken).ConfigureAwait(false);
 
             // Location and status only. The key never crosses this boundary.
