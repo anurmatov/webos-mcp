@@ -26,6 +26,18 @@ public enum TvErrorCode
 
     /// <summary>The TV returned an error that does not map to a more specific code.</summary>
     TvError,
+
+    /// <summary>The pairing tool is not enabled on this deployment.</summary>
+    PairingDisabled,
+
+    /// <summary>A human actively declined the pairing prompt on the TV.</summary>
+    PairingDenied,
+
+    /// <summary>Nobody answered the on-screen pairing prompt in time.</summary>
+    PairingTimeout,
+
+    /// <summary>The configured durable key location is missing or not writable.</summary>
+    KeyStorageReadOnly,
 }
 
 public static class TvErrorCodeExtensions
@@ -40,6 +52,10 @@ public static class TvErrorCodeExtensions
         TvErrorCode.InvalidInput => "INVALID_INPUT",
         TvErrorCode.Timeout => "TIMEOUT",
         TvErrorCode.TvError => "TV_ERROR",
+        TvErrorCode.PairingDisabled => "PAIRING_DISABLED",
+        TvErrorCode.PairingDenied => "PAIRING_DENIED",
+        TvErrorCode.PairingTimeout => "PAIRING_TIMEOUT",
+        TvErrorCode.KeyStorageReadOnly => "KEY_STORAGE_READONLY",
         _ => "TV_ERROR",
     };
 }

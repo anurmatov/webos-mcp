@@ -134,11 +134,21 @@ public sealed class SsapWebSocketConnection : ISsapConnection
         {
             response = await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (TvException ex) when (ex.Code == TvErrorCode.TvError)
+        catch (TvException ex) when (ex.Code is TvErrorCode.TvError or TvErrorCode.PairingRequired)
         {
-            // A rejected or stale key surfaces as an SSAP error on the register
-            // frame; that is a pairing problem, not a generic TV error.
-            throw TvException.PairingRequired();
+            // An SSAP error on the register frame is always a pairing problem,
+            // but WHICH one matters to the caller:
+            //
+            //   no key supplied  -> there was no stale credential to reject, so
+            //                       a human declined the on-screen prompt.
+            //   key supplied     -> the stored key was refused; re-pair.
+            //
+            // Explicit reject/cancel wording wins over that inference. Note
+            // "access denied" alone is NOT treated as a decline — it is the
+            // ordinary wording for a refused stale key.
+            throw IsExplicitDecline(ex.Message) || string.IsNullOrWhiteSpace(clientKey)
+                ? TvException.PairingDenied()
+                : TvException.PairingRequired();
         }
         finally
         {
@@ -157,6 +167,15 @@ public sealed class SsapWebSocketConnection : ISsapConnection
         }
 
         throw TvException.PairingRequired();
+    }
+
+    internal static bool IsExplicitDecline(string? detail)
+    {
+        var text = detail ?? string.Empty;
+        return text.Contains("reject", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("cancel", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("denied by", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("user denied", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string? JsonPayloadKey(JsonElement payload)

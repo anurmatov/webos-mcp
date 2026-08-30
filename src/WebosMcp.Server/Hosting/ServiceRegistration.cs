@@ -2,6 +2,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using WebosMcp.Application;
 using WebosMcp.Infrastructure;
+using WebosMcp.Server.Tools;
 
 namespace WebosMcp.Server.Hosting;
 
@@ -28,5 +29,29 @@ public static class ServiceRegistration
         services.AddSingleton<PairingService>();
 
         return services;
+    }
+
+    /// <summary>
+    /// Registers the shared tool layer. <c>pair_device</c> is added ONLY when
+    /// the operator has opted in: on a default deployment it is never
+    /// registered, so it cannot appear in tools/list or be called at all.
+    /// Both transports go through here, so neither can drift from the other.
+    /// </summary>
+    public static IMcpServerBuilder AddWebosMcpTools(
+        this IMcpServerBuilder builder,
+        IConfiguration configuration)
+    {
+        builder.WithToolsFromAssembly(typeof(ServiceRegistration).Assembly);
+
+        var enablePairing = configuration
+            .GetSection(WebosMcpOptions.SectionName)
+            .GetValue<bool>(nameof(WebosMcpOptions.EnablePairingTool));
+
+        if (enablePairing)
+        {
+            builder.WithTools<PairingTools>();
+        }
+
+        return builder;
     }
 }

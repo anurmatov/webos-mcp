@@ -31,9 +31,22 @@ services:
       WEBOSMCP__BROADCASTADDRESS: "192.0.2.255"
 
       # --- Pairing -------------------------------------------------------
-      # Read the client key from a mounted secret rather than inlining it.
-      # Produce it once with: docker compose run --rm webos-mcp pair
-      WEBOSMCP__CLIENTKEYFILE: "/run/secrets/webos_client_key"
+      # Durable, WRITABLE location pairing persists to. Backed by the named
+      # volume below so a paired key survives container replacement.
+      WEBOSMCP__CLIENTKEYPATH: "/var/lib/webos-mcp/clientkey.json"
+
+      # Optionally read the key from a mounted secret instead. Note this is
+      # READ-only to the process: if you set it and want pairing to still work,
+      # CLIENTKEYPATH above must remain a writable location, or pairing fails
+      # with KEY_STORAGE_READONLY before anyone is sent to the TV.
+      # WEBOSMCP__CLIENTKEYFILE: "/run/secrets/webos_client_key"
+
+      # Opt in to the pair_device MCP tool. Off by default: when false the tool
+      # is not registered at all and never appears in tools/list. Even when
+      # true, a human must accept the prompt on the TV — nothing pairs
+      # unattended, and the key is never returned to the caller.
+      WEBOSMCP__ENABLEPAIRINGTOOL: "false"
+      WEBOSMCP__PAIRINGTIMEOUTSECONDS: "60"
 
       # --- HTTP transport ------------------------------------------------
       # Loopback-only by default. To expose the transport beyond loopback you
@@ -42,15 +55,19 @@ services:
       WEBOS_MCP_HTTP_PORT: "8765"
       WEBOS_MCP_HTTP_TOKEN_FILE: "/run/secrets/webos_http_token"
 
+    volumes:
+      # Keeps the paired client key across container replacement.
+      - webos_keys:/var/lib/webos-mcp
+
     secrets:
-      - webos_client_key
       - webos_http_token
 
     # No `ports:` mapping. With network_mode: host the process binds directly,
     # and the bind address above is what decides its reachability.
 
+volumes:
+  webos_keys:
+
 secrets:
-  webos_client_key:
-    file: ./secrets/client_key        # gitignored; created by `webos-mcp pair`
   webos_http_token:
     file: ./secrets/http_token        # gitignored; e.g. `openssl rand -hex 32`

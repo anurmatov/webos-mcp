@@ -23,7 +23,7 @@ public static class StdioServerHost
         builder.Services
             .AddMcpServer(options => options.ServerInfo = new() { Name = "webos-mcp", Version = "1.0.0" })
             .WithStdioServerTransport()
-            .WithToolsFromAssembly(typeof(StdioServerHost).Assembly);
+            .AddWebosMcpTools(builder.Configuration);
 
         return builder.Build();
     }

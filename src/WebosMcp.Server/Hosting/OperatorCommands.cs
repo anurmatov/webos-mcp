@@ -65,11 +65,19 @@ public static class OperatorCommands
         try
         {
             Console.WriteLine("Pairing. Accept the prompt that appears on the TV screen...");
-            var location = await pairing.PairAsync(cancellationToken).ConfigureAwait(false);
+
+            // Same service the pair_device MCP tool uses — one pairing path.
+            var outcome = await pairing.PairAsync(force: false, cancellationToken).ConfigureAwait(false);
+
+            if (outcome.AlreadyPaired)
+            {
+                Console.WriteLine($"Already paired. The client key is stored at: {outcome.Location}");
+                return 0;
+            }
 
             // The location, never the key.
-            Console.WriteLine($"Paired. The client key is stored at: {location}");
-            Console.WriteLine("Keep this value private — it grants full control of the TV.");
+            Console.WriteLine($"Paired. The client key is stored at: {outcome.Location}");
+            Console.WriteLine("Verified on disk. Keep this value private — it grants full control of the TV.");
             return 0;
         }
         catch (TvException ex)

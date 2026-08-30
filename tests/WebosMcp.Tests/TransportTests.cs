@@ -5,8 +5,11 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
+using System.Collections.Generic;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using ModelContextProtocol.Client;
@@ -41,7 +44,7 @@ public sealed class TransportTests
         "tv_show_toast",
     ];
 
-    private static void ReplaceTvWithFake(IServiceCollection services, FakeSsapConnection connection)
+    internal static void ReplaceTvWithFake(IServiceCollection services, FakeSsapConnection connection)
     {
         services.RemoveAll<ISsapConnectionFactory>();
         services.AddSingleton<ISsapConnectionFactory>(new FakeSsapConnectionFactory().Enqueue(connection));
@@ -76,8 +79,8 @@ public sealed class TransportTests
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddSingleton<Microsoft.Extensions.Configuration.IConfiguration>(
-            new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build());
-        services.AddWebosMcp(new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build());
+            new ConfigurationBuilder().Build());
+        services.AddWebosMcp(new ConfigurationBuilder().Build());
         ReplaceTvWithFake(services, connection);
 
         services
@@ -136,7 +139,7 @@ public sealed class TransportTests
     {
         var services = new ServiceCollection();
         services.AddLogging();
-        services.AddWebosMcp(new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build());
+        services.AddWebosMcp(new ConfigurationBuilder().Build());
         ReplaceTvWithFake(services, new FakeSsapConnection());
 
         // No client key: every tool must return PAIRING_REQUIRED.
@@ -319,25 +322,15 @@ public sealed class TransportTests
     }
 
     [Fact]
-    public async Task No_tool_exposes_a_raw_command_screenshot_or_pairing_surface()
+    public async Task No_tool_exposes_a_raw_command_or_screenshot_surface()
     {
-        var services = new ServiceCollection();
-        services.AddLogging();
-        services.AddWebosMcp(new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build());
-        ReplaceTvWithFake(services, new FakeSsapConnection());
-
-        services
-            .AddMcpServer(options => options.ServerInfo = new() { Name = "webos-mcp", Version = "1.0.0" })
-            .WithToolsFromAssembly(typeof(HttpServerHost).Assembly);
-
-        await using var provider = services.BuildServiceProvider();
-        var names = provider.GetServices<McpServerTool>()
-            .Select(t => t.ProtocolTool.Name)
-            .ToList();
-
+        var names = RegisteredToolNames(enablePairing: false);
         Assert.NotEmpty(names);
 
-        string[] forbidden = ["ssap", "raw", "command", "screenshot", "capture", "pair", "register", "exec"];
+        // "pair" is no longer in this list: pairing is an approved, opt-in
+        // surface. Its absence by default is asserted separately below, so the
+        // two boundaries stay independently verifiable.
+        string[] forbidden = ["ssap", "raw", "command", "screenshot", "capture", "exec"];
         foreach (var name in names)
         {
             foreach (var word in forbidden)
@@ -351,6 +344,153 @@ public sealed class TransportTests
         await Task.CompletedTask;
     }
 
+    [Fact]
+    public void Pair_device_is_absent_by_default()
+    {
+        // Default deployments keep the original no-pairing-surface boundary:
+        // the tool is not registered at all, so it cannot be listed or called.
+        Assert.DoesNotContain("pair_device", RegisteredToolNames(enablePairing: false));
+    }
+
+    [Fact]
+    public void Pair_device_appears_only_when_explicitly_opted_in()
+    {
+        Assert.Contains("pair_device", RegisteredToolNames(enablePairing: true));
+    }
+
+    [Fact]
+    public async Task Pair_device_is_not_listed_over_stdio_by_default()
+    {
+        await using var fixture = await StdioFixture.StartAsync(new FakeSsapConnection());
+
+        var tools = await fixture.Client.ListToolsAsync(cancellationToken: CancellationToken.None);
+        Assert.DoesNotContain("pair_device", tools.Select(t => t.Name));
+
+        // The rest of the surface is unaffected by the gate.
+        Assert.Contains("tv_get_power_state", tools.Select(t => t.Name));
+    }
+
+    private static IReadOnlyList<string> RegisteredToolNames(bool enablePairing)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["WebosMcp:EnablePairingTool"] = enablePairing ? "true" : "false",
+            })
+            .Build();
+
+        services.AddWebosMcp(configuration);
+        ReplaceTvWithFake(services, new FakeSsapConnection());
+
+        services
+            .AddMcpServer(options => options.ServerInfo = new() { Name = "webos-mcp", Version = "1.0.0" })
+            .AddWebosMcpTools(configuration);
+
+        using var provider = services.BuildServiceProvider();
+        return [.. provider.GetServices<McpServerTool>().Select(t => t.ProtocolTool.Name)];
+    }
+
     private static string GetText(CallToolResult result) =>
         string.Concat(result.Content.OfType<TextContentBlock>().Select(c => c.Text));
+}
+
+/// <summary>
+/// Boots a real MCP server over an in-memory stream pair and connects a real
+/// client to it. Same shared tool layer the stdio transport serves.
+/// </summary>
+internal sealed class StdioFixture : IAsyncDisposable
+{
+    private readonly StreamServerTransport _serverTransport;
+    private readonly McpServer _server;
+    private readonly Task _serverTask;
+    private readonly ServiceProvider _provider;
+
+    private StdioFixture(
+        ServiceProvider provider,
+        StreamServerTransport serverTransport,
+        McpServer server,
+        Task serverTask,
+        McpClient client)
+    {
+        _provider = provider;
+        _serverTransport = serverTransport;
+        _server = server;
+        _serverTask = serverTask;
+        Client = client;
+    }
+
+    public McpClient Client { get; }
+
+    public static async Task<StdioFixture> StartAsync(
+        FakeSsapConnection connection,
+        bool enablePairing = false,
+        IClientKeyStore? keyStore = null,
+        ILoggerProvider? loggerProvider = null)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging(b =>
+        {
+            if (loggerProvider is not null)
+            {
+                b.SetMinimumLevel(LogLevel.Trace);
+                b.AddProvider(loggerProvider);
+            }
+        });
+
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["WebosMcp:EnablePairingTool"] = enablePairing ? "true" : "false",
+            })
+            .Build();
+
+        services.AddWebosMcp(configuration);
+        TransportTests.ReplaceTvWithFake(services, connection);
+
+        if (keyStore is not null)
+        {
+            services.RemoveAll<IClientKeyStore>();
+            services.AddSingleton(keyStore);
+        }
+
+        services
+            .AddMcpServer(options => options.ServerInfo = new() { Name = "webos-mcp", Version = "1.0.0" })
+            .AddWebosMcpTools(configuration);
+
+        var provider = services.BuildServiceProvider();
+
+        var clientToServer = new Pipe();
+        var serverToClient = new Pipe();
+
+        var serverTransport = new StreamServerTransport(
+            clientToServer.Reader.AsStream(),
+            serverToClient.Writer.AsStream(),
+            "webos-mcp",
+            NullLoggerFactory.Instance);
+
+        var serverOptions = provider.GetRequiredService<IOptions<McpServerOptions>>().Value;
+        var server = McpServer.Create(serverTransport, serverOptions, NullLoggerFactory.Instance, provider);
+        var serverTask = server.RunAsync(CancellationToken.None);
+
+        var clientTransport = new StreamClientTransport(
+            clientToServer.Writer.AsStream(),
+            serverToClient.Reader.AsStream(),
+            NullLoggerFactory.Instance);
+
+        var client = await McpClient.CreateAsync(clientTransport, cancellationToken: CancellationToken.None);
+
+        return new StdioFixture(provider, serverTransport, server, serverTask, client);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await Client.DisposeAsync();
+        await _serverTransport.DisposeAsync();
+        await Task.WhenAny(_serverTask, Task.Delay(2000));
+        await _server.DisposeAsync();
+        await _provider.DisposeAsync();
+    }
 }

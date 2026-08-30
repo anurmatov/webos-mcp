@@ -32,8 +32,27 @@ public sealed class WebosMcpOptions
     /// <summary>Path to a file containing the client key (mounted secret).</summary>
     public string? ClientKeyFile { get; set; }
 
-    /// <summary>Where <c>pair</c> persists the key when no explicit key/file is configured.</summary>
+    /// <summary>
+    /// The durable, WRITABLE location pairing persists the key to. This is
+    /// distinct from <see cref="ClientKeyFile"/>, which is a read-only mounted
+    /// secret: a container typically reads from the mount and must write here.
+    /// </summary>
     public string? ClientKeyPath { get; set; }
+
+    /// <summary>
+    /// Opt-in for the <c>pair_device</c> MCP tool. Defaults to FALSE, so a
+    /// default deployment exposes no pairing surface at all — the tool is not
+    /// merely refused, it is never registered and never appears in tools/list.
+    /// Pairing still requires a human to accept the prompt on the TV.
+    /// </summary>
+    public bool EnablePairingTool { get; set; }
+
+    /// <summary>
+    /// How long to wait for a human to accept the on-screen pairing prompt.
+    /// Deliberately much longer than <see cref="RequestTimeoutSeconds"/> —
+    /// someone has to physically reach the TV.
+    /// </summary>
+    public int PairingTimeoutSeconds { get; set; } = 60;
 
     public int ConnectTimeoutSeconds { get; set; } = 10;
     public int RequestTimeoutSeconds { get; set; } = 15;

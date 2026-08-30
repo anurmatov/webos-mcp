@@ -37,3 +37,13 @@ public sealed record PowerOnResult(
     IReadOnlyList<string> SentTo,
     double ElapsedSeconds,
     string Detail);
+
+/// <summary>
+/// Result of a pairing attempt. Deliberately carries the STORAGE LOCATION and
+/// never the client key itself — the key is not returned by any tool, logged,
+/// or included in any error message.
+/// </summary>
+public sealed record PairingOutcome(
+    bool AlreadyPaired,
+    string Location,
+    bool VerifiedOnDisk);

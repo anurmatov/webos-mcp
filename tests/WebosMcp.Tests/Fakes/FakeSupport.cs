@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using Microsoft.Extensions.Logging;
 using WebosMcp.Application;
+using WebosMcp.Domain;
 
 namespace WebosMcp.Tests.Fakes;
 
@@ -23,7 +24,24 @@ public sealed class FakeClientKeyStore : IClientKeyStore
         return Task.CompletedTask;
     }
 
-    public string DescribeLocation() => "(test key store)";
+    /// <summary>Null simulates a read-only key source with no writable destination.</summary>
+    public string? DurableWritablePath { get; set; } = "/test/clientkey.json";
+
+    public List<string> Persists { get; } = [];
+
+    public Task<string> PersistAsync(string clientKey, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(DurableWritablePath))
+        {
+            throw TvException.KeyStorageReadOnly("(test) no durable writable key location is configured.");
+        }
+
+        Persists.Add(clientKey);
+        Current = clientKey;
+        return Task.FromResult(DurableWritablePath!);
+    }
+
+    public string DescribeLocation() => DurableWritablePath ?? "(test read-only key source)";
 }
 
 public sealed record WolSend(string Mac, IReadOnlyList<string> Targets);

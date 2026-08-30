@@ -14,6 +14,8 @@ SSAP WebSocket protocol and Wake-on-LAN.
 - **Single TV by design.** No device registry, no per-call routing.
 - **Deliberately narrow.** No raw command passthrough, no screenshot capture,
   no hidden/service-menu actions. See [Hard boundaries](#hard-boundaries).
+- **Pairing is opt-in.** By default no pairing tool is exposed at all. It can be
+  enabled explicitly — see [Pairing over MCP](#pairing-over-mcp-opt-in).
 
 ---
 
@@ -23,6 +25,7 @@ SSAP WebSocket protocol and Wake-on-LAN.
 - [Quick start — stdio](#quick-start--stdio)
 - [Quick start — HTTP and Docker](#quick-start--http-and-docker)
 - [Discovery and pairing](#discovery-and-pairing)
+- [Pairing over MCP (opt-in)](#pairing-over-mcp-opt-in)
 - [Configuration reference](#configuration-reference)
 - [Tools](#tools)
 - [Error contract](#error-contract)
@@ -111,7 +114,8 @@ cp docker-compose.example.yml docker-compose.yml
 mkdir -p secrets
 openssl rand -hex 32 > secrets/http_token
 
-# Pair once — this writes the client key.
+# Pair once. The key is written to the named volume, so it survives the
+# container being replaced.
 docker compose run --rm webos-mcp pair
 docker compose up -d
 ```
@@ -132,9 +136,10 @@ for Wake-on-LAN over Docker — see the [WOL caveat](#wake-on-lan-in-bridge-mode
 
 ## Discovery and pairing
 
-Pairing is an **operator bootstrap step**, run from a terminal. It is
-deliberately *not* reachable as an MCP tool: it requires someone physically
-present to accept the on-screen prompt.
+Pairing is an **operator bootstrap step**, run from a terminal. It is not
+reachable as an MCP tool unless you explicitly opt in — see
+[Pairing over MCP](#pairing-over-mcp-opt-in). Either way it requires someone
+physically present to accept the on-screen prompt; nothing pairs unattended.
 
 ```bash
 webos-mcp discover   # SSDP scan; prints addresses of webOS TVs on the segment
@@ -153,6 +158,47 @@ reports only *where* it was stored. Treat it like a password.
 Pairing survives restarts. If the TV later rejects a stored key (a factory
 reset, for instance), every tool returns `PAIRING_REQUIRED` and you re-run
 `pair`.
+
+---
+
+## Pairing over MCP (opt-in)
+
+By default this server exposes **no pairing surface at all**: `pair_device` is
+not registered, does not appear in `tools/list`, and cannot be called. That is
+the safe default and most deployments should leave it alone — pair once with the
+CLI and be done.
+
+Enable it when an MCP client needs to (re-)pair without shell access, for
+example a headless container you cannot easily exec into:
+
+```bash
+export WEBOSMCP__ENABLEPAIRINGTOOL=true
+export WEBOSMCP__CLIENTKEYPATH=/var/lib/webos-mcp/clientkey.json   # must be writable
+```
+
+What the tool does and does not do:
+
+- **It cannot pair unattended.** A human must accept the on-screen prompt. The
+  tool waits up to `WEBOSMCP__PAIRINGTIMEOUTSECONDS` and then returns
+  `PAIRING_TIMEOUT`.
+- **It never returns or logs the client key.** The response carries the storage
+  location and a status, nothing else.
+- **It reports success only after the key is verified on disk.** The write is
+  atomic (temp file, flush, rename) and the file is then re-read and compared. A
+  key that did not land is an error, not a success.
+- **It refuses up front when storage is read-only**, with
+  `KEY_STORAGE_READONLY`, rather than pairing and then losing the key.
+- **Already paired is not an error.** If a working key exists it returns
+  `status: "already_paired"` without raising a prompt. Pass `force: true` to
+  re-pair deliberately.
+
+It is the same `PairingService` the `pair` CLI command uses — one code path, so
+the two cannot drift.
+
+**Enabling it widens the trust boundary**: any client that can reach the tool
+can initiate a pairing prompt on the TV. It cannot complete one alone, and it
+cannot read the key, but on the HTTP transport it should be treated as another
+reason to keep the bearer token and network placement tight.
 
 ---
 
@@ -177,9 +223,17 @@ All configuration comes from the environment. Nested keys use the standard
 |---|---|---|
 | `WEBOSMCP__CLIENTKEY` | *(none)* | Client key supplied inline. |
 | `WEBOSMCP__CLIENTKEYFILE` | *(none)* | Path to a mounted secret holding the key. Preferred for containers. |
-| `WEBOSMCP__CLIENTKEYPATH` | `~/.webos-mcp/clientkey.json` | Where `pair` persists the key when neither of the above is set. |
+| `WEBOSMCP__CLIENTKEYPATH` | `~/.webos-mcp/clientkey.json` | The **durable writable** location pairing persists to. |
+| `WEBOSMCP__ENABLEPAIRINGTOOL` | `false` | Opt in to the `pair_device` MCP tool. Off by default. |
+| `WEBOSMCP__PAIRINGTIMEOUTSECONDS` | `60` | How long to wait for a human to accept the prompt. |
 
-Resolution order is `CLIENTKEY` → `CLIENTKEYFILE` → `CLIENTKEYPATH`.
+Reading resolves in the order `CLIENTKEY` → `CLIENTKEYFILE` → `CLIENTKEYPATH`.
+
+**Writing is a separate question.** `CLIENTKEY` and `CLIENTKEYFILE` are
+operator-owned and read-only to the process, so pairing writes to
+`CLIENTKEYPATH`. In a container that reads its key from a read-only mounted
+secret, `CLIENTKEYPATH` **must** point at a writable volume or pairing fails
+with `KEY_STORAGE_READONLY` — deliberately *before* anyone is sent to the TV.
 
 ### Timeouts
 
@@ -207,7 +261,8 @@ process listings.
 
 ## Tools
 
-34 tools across seven groups. Every tool returns
+34 tools across seven groups, plus one opt-in pairing tool that is **not
+registered by default**. Every tool returns
 `{ "ok": true, "result": … }` or `{ "ok": false, "error": { "code", "message" } }`.
 
 ### Status
@@ -289,6 +344,16 @@ tuner information.
 |---|---|
 | `tv_show_toast` | On-screen toast, up to 512 characters. |
 
+### Pairing (opt-in — absent unless enabled)
+
+| Tool | Description |
+|---|---|
+| `pair_device` | Pair with the TV. Requires a human to accept the on-screen prompt. Persists the key atomically and verifies it on disk before reporting success. Never returns the key. |
+
+Not registered unless `WEBOSMCP__ENABLEPAIRINGTOOL=true`. On a default
+deployment it does not appear in `tools/list` and cannot be called.
+See [Pairing over MCP](#pairing-over-mcp-opt-in).
+
 ---
 
 ## Error contract
@@ -306,6 +371,15 @@ machine-checkable code — you never have to string-match a message.
 Plus `INVALID_INPUT` (rejected before any connection is opened), `TIMEOUT`
 and `TV_ERROR`.
 
+The opt-in pairing tool adds four more, each distinguishable:
+
+| Code | Meaning |
+|---|---|
+| `PAIRING_DISABLED` | The pairing tool is not enabled on this deployment. |
+| `PAIRING_DENIED` | A human actively declined the prompt on the TV. |
+| `PAIRING_TIMEOUT` | Nobody answered the prompt in time. |
+| `KEY_STORAGE_READONLY` | No durable writable key location is configured, or the write could not be made durable. |
+
 The pairing check runs **before** any network contact, so "you haven't paired"
 can never be masked by the TV happening to be off.
 
@@ -322,8 +396,12 @@ Deliberately absent, and not open to reconsideration as features:
 - **No screenshot or frame capture of any kind.**
 - **No hidden, service-menu or factory commands.**
 - **No multi-device orchestration.** One configured TV per instance.
-- **Pairing is never an MCP tool**, and the client key is never returned by a
-  tool, exposed in a log line, or written into an exception message.
+- **The client key is never returned by a tool, exposed in a log line, or
+  written into an exception message** — callers get a storage location only.
+- **Pairing is off by default and can never happen unattended.** The
+  `pair_device` tool is not registered unless explicitly enabled, and even then
+  a human must accept the prompt on the TV. This is the one boundary that is
+  configurable rather than absolute; every other item on this list is fixed.
 
 ---
 
@@ -362,6 +440,14 @@ WOL magic packets are normally sent as a LAN broadcast, and a broadcast does
 
 Both legs are always attempted, and `tv_power_on` reports exactly which
 targets were written to.
+
+### Pairing over MCP widens the trust boundary
+
+Disabled by default, and when enabled it still cannot pair unattended. But a
+client that can reach `pair_device` can raise a pairing prompt on the TV, which
+is a real (if minor) change in what a compromised or careless client can do. It
+cannot complete the pairing, and it cannot read the key. Leave it off unless
+something actually needs it, and keep the HTTP bearer token tight when it is on.
 
 ### Verification, not optimism
 

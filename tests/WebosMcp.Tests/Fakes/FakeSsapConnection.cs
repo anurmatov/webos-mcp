@@ -65,17 +65,25 @@ public sealed class FakeSsapConnection : ISsapConnection
         return Task.CompletedTask;
     }
 
-    public Task<string> RegisterAsync(string? clientKey, CancellationToken cancellationToken)
+    /// <summary>When set, RegisterAsync never completes — drives the pairing-timeout tests.</summary>
+    public bool HangOnRegister { get; set; }
+
+    public async Task<string> RegisterAsync(string? clientKey, CancellationToken cancellationToken)
     {
         RegisterCount++;
         LastClientKey = clientKey;
+
+        if (HangOnRegister)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+        }
 
         if (RegisterFailure is not null)
         {
             throw RegisterFailure;
         }
 
-        return Task.FromResult(IssuedClientKey ?? clientKey ?? "issued-key");
+        return IssuedClientKey ?? clientKey ?? "issued-key";
     }
 
     public async Task<JsonElement> RequestAsync(string uri, object? payload, CancellationToken cancellationToken)

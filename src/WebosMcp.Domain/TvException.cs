@@ -32,4 +32,21 @@ public sealed class TvException : Exception
 
     public static TvException TimedOut(string operation) =>
         new(TvErrorCode.Timeout, $"Operation '{operation}' did not complete within its timeout.");
+
+    public static TvException PairingDisabled() => new(
+        TvErrorCode.PairingDisabled,
+        "Pairing over MCP is disabled on this deployment. It is opt-in: set WEBOSMCP__ENABLEPAIRINGTOOL=true and " +
+        "configure a durable writable key location, or run the 'webos-mcp pair' operator command instead.");
+
+    public static TvException PairingDenied() => new(
+        TvErrorCode.PairingDenied,
+        "The pairing request was declined on the TV. Accept the on-screen prompt to pair.");
+
+    public static TvException PairingTimedOut(int seconds) => new(
+        TvErrorCode.PairingTimeout,
+        $"Nobody accepted the on-screen pairing prompt within {seconds}s. " +
+        "Pairing needs a person at the TV; try again when someone can accept it.");
+
+    public static TvException KeyStorageReadOnly(string detail) =>
+        new(TvErrorCode.KeyStorageReadOnly, detail);
 }

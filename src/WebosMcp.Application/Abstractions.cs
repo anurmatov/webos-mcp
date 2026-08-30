@@ -55,7 +55,25 @@ public interface IClientKeyStore
 {
     Task<string?> ReadAsync(CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Best-effort update used when the TV reissues a key mid-session. May be a
+    /// cache-only update when no durable writable location is configured; it
+    /// logs when that happens rather than short-circuiting silently.
+    /// </summary>
     Task WriteAsync(string clientKey, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Durably persists the key for pairing: writes atomically to the configured
+    /// writable location, then RE-READS IT FROM DISK and verifies the content
+    /// before returning. Returns the storage location — never the key.
+    /// Throws <see cref="TvException"/> with
+    /// <see cref="TvErrorCode.KeyStorageReadOnly"/> when no writable location is
+    /// configured or the write cannot be made durable.
+    /// </summary>
+    Task<string> PersistAsync(string clientKey, CancellationToken cancellationToken);
+
+    /// <summary>The configured durable writable path, or null when there is none.</summary>
+    string? DurableWritablePath { get; }
 
     /// <summary>Human-readable description of where the key lives — never the key itself.</summary>
     string DescribeLocation();

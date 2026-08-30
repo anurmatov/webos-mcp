@@ -29,7 +29,7 @@ public static class HttpServerHost
         builder.Services
             .AddMcpServer(options => options.ServerInfo = new() { Name = "webos-mcp", Version = "1.0.0" })
             .WithHttpTransport()
-            .WithToolsFromAssembly(typeof(HttpServerHost).Assembly);
+            .AddWebosMcpTools(builder.Configuration);
 
         configureBuilder?.Invoke(builder);
 
