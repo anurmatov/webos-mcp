@@ -93,4 +93,66 @@ internal static class ImageFixtures
 
     /// <summary>A real PNG with its terminal IEND chunk cut off.</summary>
     public static byte[] TruncatedPng => Png[..(Png.Length - 12)];
+
+    /// <summary>
+    /// A real JPEG whose first quantisation-table segment declares a length that
+    /// runs off the end of the file.
+    ///
+    /// The point of this fixture is what it still looks like: it opens with
+    /// FF D8 FF and closes with FF D9, so a signature check, a terminator check,
+    /// and both together all pass it. Only walking the marker segments catches it.
+    /// </summary>
+    public static byte[] MarkerCorruptedJpeg
+    {
+        get
+        {
+            var bytes = Jpeg;
+
+            // Find the first segment carrying a length and mangle that length.
+            for (var i = 2; i + 3 < bytes.Length; i++)
+            {
+                if (bytes[i] == 0xFF && bytes[i + 1] == 0xDB)
+                {
+                    bytes[i + 2] = 0xFF;
+                    bytes[i + 3] = 0xFF;
+                    return bytes;
+                }
+            }
+
+            throw new InvalidOperationException("The JPEG fixture no longer contains a DQT segment.");
+        }
+    }
+
+    /// <summary>
+    /// A real PNG with one byte of compressed image data flipped, leaving its
+    /// chunk's CRC32 no longer matching its contents.
+    ///
+    /// Same trap as above: signature intact, IEND intact, structure intact. Only
+    /// verifying the checksum catches it — which is the whole reason PNG carries
+    /// one per chunk.
+    /// </summary>
+    public static byte[] BadCrcPng
+    {
+        get
+        {
+            var bytes = Png;
+            var i = 8;
+
+            while (i + 8 <= bytes.Length)
+            {
+                var length = (bytes[i] << 24) | (bytes[i + 1] << 16) | (bytes[i + 2] << 8) | bytes[i + 3];
+                var type = System.Text.Encoding.ASCII.GetString(bytes, i + 4, 4);
+
+                if (type == "IDAT" && length > 0)
+                {
+                    bytes[i + 8] ^= 0xFF;
+                    return bytes;
+                }
+
+                i += 12 + length;
+            }
+
+            throw new InvalidOperationException("The PNG fixture no longer contains a non-empty IDAT chunk.");
+        }
+    }
 }

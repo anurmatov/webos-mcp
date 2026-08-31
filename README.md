@@ -418,12 +418,22 @@ How the frame is handled, and why each rule is there:
   violation is `INVALID_INPUT`, refused *before* the request goes out.
 - **Bounded.** Its own timeout and a streamed maximum body size, both
   range-checked at startup; an oversized body is aborted mid-read, never buffered.
-- **Validated as a complete image by its bytes**, not by the `Content-Type` header
-  and not by a leading magic number. A JPEG must carry its EOI marker and a PNG its
-  terminal IEND chunk, because a download cut short keeps its signature and loses
-  its tail — so a prefix check would report a truncated, unopenable body as a
-  successful capture. Empty, truncated, oversized, HTML or otherwise non-image
-  bodies are all `TV_ERROR`.
+- **Validated as a structurally well-formed image by its bytes** — not by the
+  `Content-Type` header, not by a leading magic number, and not by a signature plus
+  a terminator. That last one is the subtle case: a body can begin with SOI, end
+  with EOI, and be corrupt in between, so bracketing bytes prove nothing about what
+  is between them. Every JPEG marker segment must declare a length that fits, with
+  a frame header and a scan present and the scan running to EOI; every PNG chunk
+  must declare a length that fits **and** a CRC32 that matches its own contents,
+  ending at IEND with nothing after it. Empty, truncated, corrupt, oversized, HTML
+  or otherwise non-image bodies are all `TV_ERROR`.
+
+  It is deliberately not a pixel decode: no dependency is worth that here, and a
+  decoder is a large attack surface to aim at untrusted bytes. The one gap is
+  stated rather than hidden — corruption *inside* a JPEG's entropy-coded scan is
+  invisible to any structural check, because that region is arbitrary bytes by
+  definition. PNG has no such gap, since every byte of it sits inside a
+  CRC-covered chunk.
 - **JPEG and PNG only.** WebP is deliberately not supported: a RIFF length field
   can be made self-consistent over arbitrary content, so it cannot be validated to
   the standard the other two are held to, and the verified capture returns JPEG. A

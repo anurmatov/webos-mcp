@@ -45,7 +45,10 @@ public sealed class TransportTests
         "tv_take_screenshot",
     ];
 
-    internal static void ReplaceTvWithFake(IServiceCollection services, FakeSsapConnection connection)
+    internal static void ReplaceTvWithFake(
+        IServiceCollection services,
+        FakeSsapConnection connection,
+        FakeScreenshotDownloader? downloader = null)
     {
         services.RemoveAll<ISsapConnectionFactory>();
         services.AddSingleton<ISsapConnectionFactory>(new FakeSsapConnectionFactory().Enqueue(connection));
@@ -65,7 +68,7 @@ public sealed class TransportTests
         // Replaced unconditionally, not only for screenshot tests: leaving the real
         // downloader registered would let a future test reach the network.
         services.RemoveAll<IScreenshotDownloader>();
-        services.AddSingleton<IScreenshotDownloader>(new FakeScreenshotDownloader());
+        services.AddSingleton<IScreenshotDownloader>(downloader ?? new FakeScreenshotDownloader());
 
         services.Configure<WebosMcpOptions>(options =>
         {
@@ -201,11 +204,14 @@ public sealed class TransportTests
 
     // ------------------------------------------------------------- http
 
-    private static WebApplication BuildHttpApp(HttpTransportSettings settings, FakeSsapConnection connection) =>
+    private static WebApplication BuildHttpApp(
+        HttpTransportSettings settings,
+        FakeSsapConnection connection,
+        FakeScreenshotDownloader? downloader = null) =>
         HttpServerHost.Build(settings, [], builder =>
         {
             builder.WebHost.UseTestServer();
-            ReplaceTvWithFake(builder.Services, connection);
+            ReplaceTvWithFake(builder.Services, connection, downloader);
         });
 
     [Fact]
@@ -441,13 +447,11 @@ public sealed class TransportTests
     private static string GetText(CallToolResult result) =>
         string.Concat(result.Content.OfType<TextContentBlock>().Select(c => c.Text));
 
-    [Fact]
-    public async Task Http_transport_returns_a_screenshot_as_a_native_image_content_block()
+    /// <summary>
+    /// Drives a real Streamable HTTP tools/call and hands back the image block.
+    /// </summary>
+    private static async Task<ImageContentBlock> CaptureOverHttpAsync(byte[] body)
     {
-        // The wire shape, not the service method. A tool can return the right
-        // object and still be double-wrapped into JSON text by the SDK, which is
-        // exactly the leaky outcome the contract forbids — only a real tools/call
-        // over the real transport can tell the two apart.
         var connection = new FakeSsapConnection();
         connection.Respond(
             "ssap://tv/executeOneShot",
@@ -460,7 +464,9 @@ public sealed class TransportTests
             Token = "s3cret",
         };
 
-        await using var app = BuildHttpApp(settings, connection);
+        await using var app = BuildHttpApp(
+            settings, connection, new FakeScreenshotDownloader { Body = body });
+
         await app.StartAsync(CancellationToken.None);
 
         var httpClient = app.GetTestClient();
@@ -486,16 +492,56 @@ public sealed class TransportTests
         Assert.NotEqual(true, result.IsError);
 
         var block = Assert.IsType<ImageContentBlock>(Assert.Single(result.Content));
-        Assert.Equal("image/jpeg", block.MimeType);
-
-        // Decoded by the CLIENT, from the wire. This is what fails if the block is
-        // built with raw bytes in Data instead of base64 text.
-        Assert.Equal(ImageFixtures.Jpeg, block.DecodedData.ToArray());
 
         // No text or base64-string content block alongside it.
         Assert.Empty(result.Content.OfType<TextContentBlock>());
 
         await app.StopAsync(CancellationToken.None);
+
+        return block;
+    }
+
+    [Fact]
+    public async Task Http_transport_returns_a_png_that_really_decodes_to_the_expected_image()
+    {
+        // The success criterion is a DECODE, not a byte-compare against the
+        // fixture. Comparing bytes proves the transport copied an array; it says
+        // nothing about whether that array was ever a usable image, and would pass
+        // identically if the fixture were garbage.
+        var block = await CaptureOverHttpAsync(ImageFixtures.Png);
+
+        Assert.Equal("image/png", block.MimeType);
+
+        // Decoded from the wire bytes: chunk walk, zlib inflate, unfilter, pixels.
+        var image = ImageDecoding.DecodePng(block.DecodedData.ToArray());
+
+        Assert.Equal(2, image.Width);
+        Assert.Equal(2, image.Height);
+        Assert.Equal(2 * 2 * 4, image.Rgba.Length);
+
+        // Every pixel is the fixture's solid colour, alpha opaque.
+        for (var pixel = 0; pixel < 4; pixel++)
+        {
+            Assert.Equal(
+                new byte[] { 0x20, 0x60, 0xA0, 0xFF },
+                image.Rgba[(pixel * 4)..((pixel * 4) + 4)]);
+        }
+    }
+
+    [Fact]
+    public async Task Http_transport_returns_a_jpeg_whose_frame_header_reports_the_expected_size()
+    {
+        // JPEG is what the TV actually returns, so it gets its own end-to-end pass.
+        // Reaching a well-formed frame header requires every preceding marker
+        // segment to be intact.
+        var block = await CaptureOverHttpAsync(ImageFixtures.Jpeg);
+
+        Assert.Equal("image/jpeg", block.MimeType);
+
+        var (width, height) = ImageDecoding.ReadJpegDimensions(block.DecodedData.ToArray());
+
+        Assert.Equal(2, width);
+        Assert.Equal(2, height);
     }
 }
 

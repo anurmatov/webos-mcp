@@ -304,6 +304,73 @@ public sealed class ScreenshotTests
     }
 
     [Fact]
+    public void A_jpeg_that_is_corrupt_BETWEEN_a_valid_signature_and_a_valid_EOI_is_rejected()
+    {
+        var corrupt = ImageFixtures.MarkerCorruptedJpeg;
+
+        // The fixture's whole point: it passes every check a bracket-based
+        // validator can make. If these three assertions ever fail, the negative
+        // control has stopped testing what it claims to.
+        Assert.Equal<byte[]>([0xFF, 0xD8, 0xFF], corrupt[..3]);
+        Assert.Equal<byte[]>([0xFF, 0xD9], corrupt[^2..]);
+        Assert.Equal(ImageFixtures.Jpeg.Length, corrupt.Length);
+
+        var ex = Assert.Throws<TvException>(() => ScreenshotPolicy.DetectImageMimeType(corrupt));
+
+        Assert.Equal(TvErrorCode.TvError, ex.Code);
+        Assert.Contains("length", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void A_png_whose_chunk_no_longer_matches_its_own_CRC_is_rejected()
+    {
+        var corrupt = ImageFixtures.BadCrcPng;
+
+        // Same shape: signature intact, IEND intact, chunk lengths intact. Only
+        // verifying the checksum catches it.
+        Assert.Equal<byte[]>([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], corrupt[..8]);
+        Assert.Equal("IEND"u8.ToArray(), corrupt[^8..^4]);
+        Assert.Equal(ImageFixtures.Png.Length, corrupt.Length);
+
+        var ex = Assert.Throws<TvException>(() => ScreenshotPolicy.DetectImageMimeType(corrupt));
+
+        Assert.Equal(TvErrorCode.TvError, ex.Code);
+        Assert.Contains("CRC32", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_corrupt_capture_is_never_reported_as_a_successful_screenshot()
+    {
+        // End to end through the capture path, not just the validator: the tool
+        // must fail rather than hand back an image nothing can open.
+        var harness = HarnessAnnouncing(CaptureUri);
+        harness.Downloader.Body = ImageFixtures.MarkerCorruptedJpeg;
+
+        Assert.Equal(TvErrorCode.TvError, await CodeOf(harness));
+    }
+
+    [Fact]
+    public void The_good_fixtures_still_pass_the_structural_walk()
+    {
+        // The other half of the mutation argument: the checks must reject corrupt
+        // images WITHOUT rejecting real ones. A validator that failed everything
+        // would pass every negative control above.
+        Assert.Equal("image/jpeg", ScreenshotPolicy.DetectImageMimeType(ImageFixtures.Jpeg));
+        Assert.Equal("image/png", ScreenshotPolicy.DetectImageMimeType(ImageFixtures.Png));
+    }
+
+    [Fact]
+    public void Trailing_bytes_after_the_terminator_are_rejected_for_both_formats()
+    {
+        // An image with something appended is not the image it claims to be.
+        Assert.Throws<TvException>(
+            () => ScreenshotPolicy.DetectImageMimeType([.. ImageFixtures.Jpeg, .. "trailing"u8]));
+
+        Assert.Throws<TvException>(
+            () => ScreenshotPolicy.DetectImageMimeType([.. ImageFixtures.Png, .. "trailing"u8]));
+    }
+
+    [Fact]
     public void A_jpeg_padded_with_trailing_nulls_after_its_EOI_is_still_accepted()
     {
         // Some transports pad to a block boundary. A bounded allowance accepts that

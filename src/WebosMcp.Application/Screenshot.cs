@@ -179,23 +179,37 @@ public static class ScreenshotPolicy
     }
 
     /// <summary>
-    /// Identifies the payload by its bytes, and requires the file to be COMPLETE.
+    /// Identifies the payload by its bytes, and requires the file to be
+    /// STRUCTURALLY WELL FORMED — not merely to start and end correctly.
     ///
-    /// The <c>Content-Type</c> header is not consulted: a TV — or anything
-    /// answering in its place — can label an HTML error page <c>image/jpeg</c>.
+    /// Three checks were tried and each was weaker than it looked:
     ///
-    /// Nor is a leading magic number sufficient. A download cut short by a reset
-    /// connection keeps its signature and loses its tail, so a prefix check calls a
-    /// truncated, undecodable body a successful capture — the same unverified
-    /// success this project refuses everywhere else, arriving through the one door
-    /// a header check does not cover. Each format is therefore accepted only with
-    /// its terminator present: a JPEG's EOI marker, a PNG's IEND chunk.
+    ///   - The <c>Content-Type</c> header. Anything answering in the TV's place can
+    ///     label an HTML error page <c>image/jpeg</c>.
+    ///   - A leading magic number. A download cut short keeps its signature and
+    ///     loses its tail, so a truncated, unopenable body reads as a success.
+    ///   - A signature AND a terminator. This is the subtle one: a body can begin
+    ///     with SOI, end with EOI, and be corrupt in between — a mangled segment
+    ///     length, a chunk whose contents no longer match its checksum — and still
+    ///     pass. Bracketing bytes say nothing about what is between them.
+    ///
+    /// So the bytes are walked: every JPEG marker segment must carry a length that
+    /// fits, with a frame header and a scan present and the scan running to EOI;
+    /// every PNG chunk must carry a length that fits AND a CRC32 that matches its
+    /// own contents, ending at IEND with nothing after it. That is what makes
+    /// "this is an image" a checked claim rather than a plausible one.
+    ///
+    /// It is deliberately NOT a pixel decode — no production dependency is worth
+    /// that here, and a decoder is a large attack surface to point at untrusted
+    /// bytes. The known gap is stated rather than papered over: corruption inside
+    /// a JPEG's entropy-coded scan is invisible to any structural check, because
+    /// that region is arbitrary bytes by definition. PNG has no such gap, since
+    /// every byte of it is inside a CRC-covered chunk.
     ///
     /// WebP is deliberately NOT supported. A RIFF length field can be made
-    /// self-consistent over arbitrary content, so the check available for it is
-    /// materially weaker than the other two, and the verified probe returned JPEG.
-    /// A TV that answers with WebP gets an honest TV_ERROR naming the supported
-    /// formats rather than a capture validated to a lower standard.
+    /// self-consistent over arbitrary content, and it carries no per-chunk
+    /// checksum, so it cannot be held to this standard. The verified probe returns
+    /// JPEG; a TV answering with WebP gets an honest TV_ERROR.
     /// </summary>
     public static string DetectImageMimeType(ReadOnlySpan<byte> bytes)
     {
@@ -208,9 +222,14 @@ public static class ScreenshotPolicy
 
         if (bytes.Length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
         {
-            if (bytes.Length < MinJpegBytes || !EndsWithJpegEoi(bytes))
+            if (bytes.Length < MinJpegBytes)
             {
-                throw Incomplete("JPEG", "its EOI (FF D9) end-of-image marker", bytes.Length);
+                throw Malformed("JPEG", "it is far too short to hold a frame header and a scan", bytes.Length);
+            }
+
+            if (ValidateJpeg(TrimTrailingPadding(bytes)) is { } jpegProblem)
+            {
+                throw Malformed("JPEG", jpegProblem, bytes.Length);
             }
 
             return Jpeg;
@@ -218,9 +237,14 @@ public static class ScreenshotPolicy
 
         if (bytes.Length >= PngSignature.Length && bytes[..PngSignature.Length].SequenceEqual(PngSignature))
         {
-            if (bytes.Length < MinPngBytes || !bytes[^PngIend.Length..].SequenceEqual(PngIend))
+            if (bytes.Length < MinPngBytes)
             {
-                throw Incomplete("PNG", "its terminal IEND chunk", bytes.Length);
+                throw Malformed("PNG", "it is far too short to hold IHDR, IDAT and IEND", bytes.Length);
+            }
+
+            if (ValidatePng(bytes) is { } pngProblem)
+            {
+                throw Malformed("PNG", pngProblem, bytes.Length);
             }
 
             return Png;
@@ -232,13 +256,274 @@ public static class ScreenshotPolicy
             "Expected a complete JPEG or PNG, identified by content rather than by the declared Content-Type.");
     }
 
-    private static TvException Incomplete(string format, string terminator, int length) => new(
+    private static TvException Malformed(string format, string problem, int length) => new(
         TvErrorCode.TvError,
-        $"The capture download returned {length} bytes that begin as a {format} but are missing " +
-        $"{terminator}. The download was truncated, so the image is incomplete and is not reported " +
-        "as a successful capture.");
+        $"The capture download returned {length} bytes that begin as a {format} but are not a valid one: " +
+        $"{problem}. A truncated or corrupt body is not reported as a successful capture.");
 
-    private static bool EndsWithJpegEoi(ReadOnlySpan<byte> bytes)
+    /// <summary>
+    /// Walks the marker structure. Returns null when well formed, or a short
+    /// description of the first problem found.
+    /// </summary>
+    private static string? ValidateJpeg(ReadOnlySpan<byte> bytes)
+    {
+        var i = 2; // past SOI
+        var seenFrameHeader = false;
+        var seenScan = false;
+
+        while (i < bytes.Length)
+        {
+            if (bytes[i] != 0xFF)
+            {
+                return $"expected a marker at byte {i} and found none";
+            }
+
+            // Any number of 0xFF fill bytes may precede a marker.
+            while (i < bytes.Length && bytes[i] == 0xFF)
+            {
+                i++;
+            }
+
+            if (i >= bytes.Length)
+            {
+                return "the data ends in marker padding with no end-of-image marker";
+            }
+
+            var marker = bytes[i++];
+
+            // Standalone markers carry no segment.
+            if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
+            {
+                continue;
+            }
+
+            if (marker == 0xD9) // EOI
+            {
+                if (i != bytes.Length)
+                {
+                    return $"{bytes.Length - i} unexpected bytes follow the end-of-image marker";
+                }
+
+                if (!seenFrameHeader)
+                {
+                    return "it carries no frame header (SOF), so it describes no image";
+                }
+
+                return seenScan ? null : "it carries no scan (SOS), so it contains no image data";
+            }
+
+            if (i + 2 > bytes.Length)
+            {
+                return $"the segment at byte {i} is cut off before its length";
+            }
+
+            var segmentLength = (bytes[i] << 8) | bytes[i + 1];
+
+            // The length includes its own two bytes, so anything below 2 is
+            // nonsense and anything overrunning the buffer is corrupt.
+            if (segmentLength < 2 || i + segmentLength > bytes.Length)
+            {
+                return $"the segment at byte {i} declares a length of {segmentLength} that does not fit";
+            }
+
+            // SOF0..SOF15, excluding DHT (C4), JPG (C8) and DAC (CC).
+            if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC)
+            {
+                seenFrameHeader = true;
+            }
+
+            i += segmentLength;
+
+            if (marker == 0xDA) // SOS: entropy-coded data follows, then a marker
+            {
+                seenScan = true;
+                i = SkipEntropyCodedData(bytes, i);
+            }
+        }
+
+        return "the data ends without an end-of-image marker";
+    }
+
+    /// <summary>
+    /// Advances past the entropy-coded scan to the next real marker.
+    ///
+    /// Inside the scan a literal 0xFF is stuffed as <c>FF 00</c>, and restart
+    /// markers are expected — neither ends the scan. Anything else after an 0xFF
+    /// does.
+    /// </summary>
+    private static int SkipEntropyCodedData(ReadOnlySpan<byte> bytes, int i)
+    {
+        while (i < bytes.Length)
+        {
+            if (bytes[i] != 0xFF)
+            {
+                i++;
+                continue;
+            }
+
+            if (i + 1 >= bytes.Length)
+            {
+                return i;
+            }
+
+            var next = bytes[i + 1];
+
+            if (next == 0x00 || (next >= 0xD0 && next <= 0xD7))
+            {
+                i += 2;
+                continue;
+            }
+
+            if (next == 0xFF)
+            {
+                i++;
+                continue;
+            }
+
+            return i;
+        }
+
+        return i;
+    }
+
+    /// <summary>
+    /// Walks the chunk structure and verifies every CRC. Returns null when well
+    /// formed, or a short description of the first problem found.
+    ///
+    /// The CRC is what makes this stronger than a bracket check: every byte of a
+    /// PNG lives inside a chunk that carries a checksum over its own contents, so
+    /// corruption anywhere is detectable without decoding a single pixel.
+    /// </summary>
+    private static string? ValidatePng(ReadOnlySpan<byte> bytes)
+    {
+        var i = PngSignature.Length;
+        var first = true;
+        var seenHeader = false;
+        var seenData = false;
+
+        while (i < bytes.Length)
+        {
+            if (i + 8 > bytes.Length)
+            {
+                return $"the chunk at byte {i} is cut off before its header";
+            }
+
+            var length = ((uint)bytes[i] << 24) | ((uint)bytes[i + 1] << 16) |
+                         ((uint)bytes[i + 2] << 8) | bytes[i + 3];
+
+            if (length > int.MaxValue)
+            {
+                return $"the chunk at byte {i} declares an impossible length";
+            }
+
+            var typeStart = i + 4;
+            var dataStart = typeStart + 4;
+
+            if (dataStart + (long)length + 4 > bytes.Length)
+            {
+                return $"the chunk at byte {i} declares a length of {length} that does not fit";
+            }
+
+            var type = bytes.Slice(typeStart, 4);
+            var declaredCrc = ((uint)bytes[dataStart + (int)length] << 24) |
+                              ((uint)bytes[dataStart + (int)length + 1] << 16) |
+                              ((uint)bytes[dataStart + (int)length + 2] << 8) |
+                              bytes[dataStart + (int)length + 3];
+
+            // The CRC covers the type and the data, not the length.
+            if (Crc32(bytes.Slice(typeStart, 4 + (int)length)) != declaredCrc)
+            {
+                return $"the {Describe(type)} chunk at byte {i} does not match its own CRC32 checksum";
+            }
+
+            var isHeader = type.SequenceEqual("IHDR"u8);
+            var isEnd = type.SequenceEqual("IEND"u8);
+
+            if (first && !isHeader)
+            {
+                return "its first chunk is not IHDR";
+            }
+
+            seenHeader |= isHeader;
+            seenData |= type.SequenceEqual("IDAT"u8);
+            first = false;
+
+            i = dataStart + (int)length + 4;
+
+            if (isEnd)
+            {
+                if (i != bytes.Length)
+                {
+                    return $"{bytes.Length - i} unexpected bytes follow the IEND chunk";
+                }
+
+                if (!seenHeader)
+                {
+                    return "it carries no IHDR chunk, so it describes no image";
+                }
+
+                return seenData ? null : "it carries no IDAT chunk, so it contains no image data";
+            }
+        }
+
+        return "the data ends without an IEND chunk";
+    }
+
+    private static string Describe(ReadOnlySpan<byte> type)
+    {
+        Span<char> name = stackalloc char[4];
+        for (var i = 0; i < 4; i++)
+        {
+            // Chunk types are ASCII letters; anything else is shown as '?' rather
+            // than echoed raw into a message.
+            name[i] = char.IsAsciiLetter((char)type[i]) ? (char)type[i] : '?';
+        }
+
+        return new string(name);
+    }
+
+    /// <summary>
+    /// The standard CRC-32 PNG uses. Implemented here rather than taken from a
+    /// package: it is fifteen lines, and a production dependency for it would be a
+    /// poor trade.
+    /// </summary>
+    private static uint Crc32(ReadOnlySpan<byte> data)
+    {
+        var crc = 0xFFFFFFFFu;
+
+        foreach (var b in data)
+        {
+            crc = Crc32Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
+        }
+
+        return crc ^ 0xFFFFFFFFu;
+    }
+
+    private static readonly uint[] Crc32Table = BuildCrc32Table();
+
+    private static uint[] BuildCrc32Table()
+    {
+        var table = new uint[256];
+
+        for (uint n = 0; n < 256; n++)
+        {
+            var c = n;
+            for (var k = 0; k < 8; k++)
+            {
+                c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            }
+
+            table[n] = c;
+        }
+
+        return table;
+    }
+
+    /// <summary>
+    /// Drops a bounded run of trailing NULs. Some transports pad to a block
+    /// boundary, and that padding is not part of the JPEG.
+    /// </summary>
+    private static ReadOnlySpan<byte> TrimTrailingPadding(ReadOnlySpan<byte> bytes)
     {
         var end = bytes.Length;
         var floor = Math.Max(2, end - MaxTrailingPadding);
@@ -248,7 +533,7 @@ public static class ScreenshotPolicy
             end--;
         }
 
-        return end >= 2 && bytes[end - 2] == 0xFF && bytes[end - 1] == 0xD9;
+        return bytes[..end];
     }
 
     private static bool HostsMatch(string candidate, string other)
