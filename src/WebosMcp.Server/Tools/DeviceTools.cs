@@ -36,8 +36,8 @@ public sealed class DeviceTools
         "Registers nothing; pass an address to tv_register_device to keep it.")]
     public Task<ToolResult> Discover(
         [Description("Optional TV address to probe directly instead of scanning. Works in a container.")]
-        string? host,
-        CancellationToken cancellationToken) =>
+        string? host = null,
+        CancellationToken cancellationToken = default) =>
         ToolInvoker.RunAsync(_logger, "tv_discover_devices", async () =>
         {
             if (!string.IsNullOrWhiteSpace(host))
@@ -72,8 +72,8 @@ public sealed class DeviceTools
         "already-known address updates it rather than duplicating. Pair with the TV afterwards.")]
     public Task<ToolResult> Register(
         [Description("TV address, for example 192.0.2.10.")] string host,
-        [Description("Optional label for this TV.")] string? name,
-        CancellationToken cancellationToken) =>
+        [Description("Optional label for this TV.")] string? name = null,
+        CancellationToken cancellationToken = default) =>
         ToolInvoker.RunAsync(_logger, "tv_register_device", async () =>
         {
             var device = await _devices.RegisterAsync(host, name, makeActive: true, cancellationToken);
@@ -134,10 +134,10 @@ public sealed class DeviceTools
         "example a MAC that could not be read from the network. Omitted fields are left unchanged.")]
     public Task<ToolResult> Update(
         [Description("Device id from tv_list_devices.")] string id,
-        [Description("MAC address, for example 00:11:22:33:44:55.")] string? macAddress,
-        [Description("Broadcast address, for example 192.0.2.255.")] string? broadcastAddress,
-        [Description("Label for this TV.")] string? name,
-        CancellationToken cancellationToken) =>
+        [Description("MAC address, for example 00:11:22:33:44:55.")] string? macAddress = null,
+        [Description("Broadcast address, for example 192.0.2.255.")] string? broadcastAddress = null,
+        [Description("Label for this TV.")] string? name = null,
+        CancellationToken cancellationToken = default) =>
         ToolInvoker.RunAsync(_logger, "tv_update_device", async () =>
             new { device = Describe(await _devices.UpdateAsync(id, macAddress, broadcastAddress, name, cancellationToken)) });
 

@@ -146,6 +146,12 @@ internal sealed class LoungeSession : ILoungeSession
 {
     private const string BindPath = "/api/lounge/bc/bind";
 
+    /// <summary>
+    /// The app identity the receiver expects from a remote. Not cosmetic — it is
+    /// part of the handshake the receiver validates.
+    /// </summary>
+    private const string AppName = "youtube-desktop";
+
     private readonly HttpClient _http;
     private readonly Uri _baseUrl;
     private readonly string _loungeToken;
@@ -243,13 +249,13 @@ internal sealed class LoungeSession : ILoungeSession
     /// </summary>
     internal IReadOnlyList<KeyValuePair<string, string>> BuildBindFields() =>
     [
-        new("app", "webos-mcp"),
+        new("app", AppName),
         new("mdx-version", "3"),
         new("name", _deviceName),
         new("id", _screenId),
         new("device", "REMOTE_CONTROL"),
         new("capabilities", "que,dsdtr,atp"),
-        new("method", "setPlaylist"),
+        new("deviceContext", "user_agent=webos-mcp"),
         new("magnaKey", "cloudPairedDevice"),
         new("ui", "false"),
         new("theme", "cl"),
@@ -267,12 +273,9 @@ internal sealed class LoungeSession : ILoungeSession
 
         try
         {
-            var url = BuildUrl(new Dictionary<string, string>
+            var url = BuildSessionUrl(new Dictionary<string, string>
             {
                 ["RID"] = Interlocked.Increment(ref _requestId).ToString(CultureInfo.InvariantCulture),
-                ["SID"] = _sessionId ?? string.Empty,
-                ["gsessionid"] = _gSessionId ?? string.Empty,
-                ["CVER"] = "1",
             });
 
             var fields = new List<KeyValuePair<string, string>>
@@ -321,11 +324,9 @@ internal sealed class LoungeSession : ILoungeSession
         {
             string body;
 
-            var url = BuildUrl(new Dictionary<string, string>
+            var url = BuildSessionUrl(new Dictionary<string, string>
             {
                 ["RID"] = "rpc",
-                ["SID"] = _sessionId ?? string.Empty,
-                ["gsessionid"] = _gSessionId ?? string.Empty,
                 ["CI"] = "0",
                 ["TYPE"] = "xmlhttp",
                 ["AID"] = lastEventId.ToString(CultureInfo.InvariantCulture),
@@ -375,20 +376,25 @@ internal sealed class LoungeSession : ILoungeSession
         }
     }
 
-    private Uri BuildUrl(IReadOnlyDictionary<string, string> extra)
+    /// <summary>
+    /// The query for a command post or an event poll: the app identity plus the
+    /// receiver session fields, and nothing else.
+    ///
+    /// The device metadata that belongs in the BIND FORM BODY (id, mdx-version, ui,
+    /// t) does not belong here, and the token does not either — it travels as a
+    /// header on these paths, so no live credential is ever in a URL that request
+    /// logging could print.
+    /// </summary>
+    private Uri BuildSessionUrl(IReadOnlyDictionary<string, string> extra)
     {
         var query = new Dictionary<string, string>
         {
-            ["device"] = "REMOTE_CONTROL",
-            ["mdx-version"] = "3",
-            ["ui"] = "false",
-            ["v"] = "2",
+            ["app"] = AppName,
             ["VER"] = "8",
-            ["app"] = "webos-mcp",
-            ["name"] = _deviceName,
-            ["id"] = _screenId,
-            ["loungeIdToken"] = _loungeToken,
-            ["t"] = "1",
+            ["CVER"] = "1",
+            ["auth_failure_option"] = "send_error",
+            ["SID"] = _sessionId ?? string.Empty,
+            ["gsessionid"] = _gSessionId ?? string.Empty,
         };
 
         foreach (var (key, value) in extra)
@@ -401,7 +407,8 @@ internal sealed class LoungeSession : ILoungeSession
 
         var encoded = string.Join(
             "&",
-            query.Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
+            query.Where(kv => !string.IsNullOrEmpty(kv.Value))
+                .Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
 
         return new Uri(_baseUrl, $"{BindPath}?{encoded}");
     }

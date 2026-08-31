@@ -157,6 +157,101 @@ public sealed class LoungeBindShapeTests
     }
 
     [Fact]
+    public async Task The_bind_body_carries_the_proven_app_identity_and_capabilities()
+    {
+        // app is not cosmetic — it is part of what the receiver validates.
+        var (client, http) = Build();
+
+        await client.ConnectAsync(ScreenId, CancellationToken.None);
+        var fields = Fields(http.Requests[1].Body);
+
+        Assert.Equal("youtube-desktop", fields["app"]);
+        Assert.Equal("que,dsdtr,atp", fields["capabilities"]);
+        Assert.True(fields.ContainsKey("deviceContext"));
+        Assert.False(fields.ContainsKey("method"));
+    }
+
+    // ---- command and event-stream shapes -----------------------------------
+
+    private static async Task<CapturingLoungeHandler> ConnectedAsync()
+    {
+        var (client, http) = Build();
+        var session = await client.ConnectAsync(ScreenId, CancellationToken.None);
+        Assert.NotNull(session);
+
+        await session!.SendAsync("pause", new Dictionary<string, string> { ["x"] = "1" }, CancellationToken.None);
+        return http;
+    }
+
+    [Fact]
+    public async Task The_command_query_carries_the_app_and_session_fields_and_nothing_else()
+    {
+        var query = Query((await ConnectedAsync()).Requests[2].Url);
+
+        Assert.Equal("youtube-desktop", query["app"]);
+        Assert.Equal("SID-1", query["SID"]);
+        Assert.Equal("GSESSION-1", query["gsessionid"]);
+        Assert.Equal("8", query["VER"]);
+
+        // The bind-body metadata does not belong on this path.
+        foreach (var stray in new[] { "id", "mdx-version", "ui", "t", "name", "device" })
+        {
+            Assert.False(query.ContainsKey(stray), $"'{stray}' should not be in the command query");
+        }
+    }
+
+    [Fact]
+    public async Task The_command_carries_the_token_as_a_HEADER_and_never_in_the_url()
+    {
+        // Correcting the record from the previous round: bind was fixed then, but
+        // commands still carried the token in the query under log-filter protection.
+        var http = await ConnectedAsync();
+
+        Assert.Equal(Token, http.Requests[2].TokenHeader);
+        Assert.DoesNotContain(Token, http.Requests[2].Url, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task The_command_body_is_the_indexed_req0_form()
+    {
+        var fields = Fields((await ConnectedAsync()).Requests[2].Body);
+
+        Assert.Equal("1", fields["count"]);
+        Assert.Equal("pause", fields["req0__sc"]);
+        Assert.Equal("1", fields["req0_x"]);
+    }
+
+    [Fact]
+    public async Task The_event_poll_query_matches_the_same_shape_plus_the_stream_fields()
+    {
+        var (client, http) = Build();
+        var session = await client.ConnectAsync(ScreenId, CancellationToken.None);
+
+        using var stop = new CancellationTokenSource();
+        await foreach (var _ in session!.ObserveAsync(stop.Token))
+        {
+            break;
+        }
+
+        var poll = http.Requests[2];
+        var query = Query(poll.Url);
+
+        Assert.Equal("youtube-desktop", query["app"]);
+        Assert.Equal("rpc", query["RID"]);
+        Assert.Equal("SID-1", query["SID"]);
+        Assert.Equal("xmlhttp", query["TYPE"]);
+        Assert.True(query.ContainsKey("AID"));
+
+        Assert.Equal(Token, poll.TokenHeader);
+        Assert.DoesNotContain(Token, poll.Url, StringComparison.Ordinal);
+
+        foreach (var stray in new[] { "id", "mdx-version", "ui", "t" })
+        {
+            Assert.False(query.ContainsKey(stray), $"'{stray}' should not be in the event query");
+        }
+    }
+
+    [Fact]
     public async Task The_screen_id_is_what_the_token_is_requested_for()
     {
         var (client, http) = Build();

@@ -111,10 +111,11 @@ thing.
 
 > On stdio, stdout is the protocol channel. All logging goes to stderr.
 
-> The YouTube Lounge token travels as a URL query parameter, and `HttpClient`'s
-> built-in logging writes full request URIs. All three entry points therefore raise
-> the HTTP logging categories to `Warning`, so no live credential is printed.
-> Warnings and errors still surface — they carry no URI.
+> The YouTube Lounge token is sent as a form field or an
+> `X-YouTube-LoungeId-Token` header and never appears in a URL, so request logging
+> cannot print it. All three entry points additionally raise the HTTP logging
+> categories to `Warning` as defence in depth. Warnings and errors still surface —
+> they carry no URI.
 
 ---
 
