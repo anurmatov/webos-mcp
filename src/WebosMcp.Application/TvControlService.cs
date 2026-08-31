@@ -31,13 +31,19 @@ public sealed record YouTubeControlResult(
 
 /// <param name="ObservedVideoId">The video id the receiver itself reported, when it reported one.</param>
 /// <param name="ObservedState">The player state the receiver itself reported, when it reported one.</param>
+/// <param name="ConfirmedVia">
+/// Which observation actually confirmed this — the receiver's announcement, or the
+/// bounded read-back used only when the announcement was missed. Named rather than
+/// blurred, so a run that needed the fallback is visible as such.
+/// </param>
 public sealed record ContentActionResult(
     ActionPath Path,
     string Detail,
     string? AppId = null,
     bool ExactVideoConfirmed = false,
     string? ObservedVideoId = null,
-    string? ObservedState = null);
+    string? ObservedState = null,
+    string? ConfirmedVia = null);
 
 /// <summary>
 /// The shared capability layer. Both transports (stdio and Streamable HTTP)
@@ -423,32 +429,101 @@ public sealed class TvControlService
             },
             ct).ConfigureAwait(false);
 
-        // Acceptance is still not playback. Wait for the RECEIVER to report this
-        // video id in a playing state, on the stream that was already open when the
-        // command went out — the first read-back this tool has ever had.
-        var observed = await ObserveAsync(
-            subscription,
-            state => string.Equals(state.VideoId, videoId, StringComparison.Ordinal)
-                     && state.State is LoungePlayerState.Playing,
-            ct).ConfigureAwait(false);
+        // Acceptance is still not playback. Wait for the RECEIVER to report this video
+        // playing, on the stream that was already being read when the command went
+        // out. The reports are CORRELATED rather than matched one at a time: the id
+        // and the playing state arrive in separate events, and demanding both at once
+        // is a false negative — see ReceiverStateTracker.
+        var tracker = new ReceiverStateTracker();
+
+        var observed = await ObserveVideoPlayingAsync(subscription, tracker, videoId, ct).ConfigureAwait(false);
+        var confirmedVia = "event stream";
+
+        if (observed is null)
+        {
+            // Defense in depth ONLY, and strictly secondary: if the announcement was
+            // missed, ask the receiver what it is playing and judge that answer by
+            // exactly the same rule. This can turn a missed event into a correct
+            // success; it can never turn a wrong video into one.
+            observed = await ConfirmByAskingAsync(session, subscription, tracker, videoId, ct)
+                .ConfigureAwait(false);
+
+            confirmedVia = "getNowPlaying read-back";
+        }
 
         if (observed is null)
         {
             throw new TvException(
                 TvErrorCode.TvError,
                 $"The receiver accepted the request for video '{videoId}' but never reported it playing " +
-                $"within {_options.LoungeVerifyTimeoutSeconds}s. Reporting failure rather than an " +
-                "unverified success.");
+                $"within {_options.LoungeVerifyTimeoutSeconds}s, and a direct read-back did not show it " +
+                "playing either. Reporting failure rather than an unverified success.");
         }
 
         return new ContentActionResult(
             ActionPath.Lounge,
             $"Loaded video '{videoId}' into the running YouTube receiver and observed it reported back as " +
-            $"playing after {Elapsed(started):0.0}s.",
+            $"playing after {Elapsed(started):0.0}s, confirmed via the {confirmedVia}.",
             AppId: null,
             ExactVideoConfirmed: true,
             ObservedVideoId: observed.VideoId,
-            ObservedState: observed.State.ToString());
+            ObservedState: observed.State.ToString(),
+            ConfirmedVia: confirmedVia);
+    }
+
+    /// <summary>
+    /// Waits for the correlated picture of the receiver to reach "this video, playing".
+    /// Null means it never did within the budget, which callers report as failure.
+    /// </summary>
+    private async Task<LoungeReceiverState?> ObserveVideoPlayingAsync(
+        ILoungeSubscription subscription,
+        ReceiverStateTracker tracker,
+        string videoId,
+        CancellationToken ct)
+    {
+        return await ObserveAsync(
+            subscription,
+            tracker,
+            state => string.Equals(state.VideoId, videoId, StringComparison.Ordinal)
+                     && state.State is LoungePlayerState.Playing,
+            _options.LoungeVerifyTimeoutSeconds,
+            ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// One bounded read-back, used only after the event stream failed to confirm.
+    ///
+    /// The receiver answers <c>getNowPlaying</c> on the same stream, which is still
+    /// being pumped, so this is a nudge rather than a second mechanism — and the
+    /// answer is held to the identical requested-id-plus-playing rule. Deliberately
+    /// NOT part of the primary path: an unprompted read-back cannot distinguish a
+    /// video that started because of this request from one that was already playing.
+    /// </summary>
+    private async Task<LoungeReceiverState?> ConfirmByAskingAsync(
+        ILoungeSession session,
+        ILoungeSubscription subscription,
+        ReceiverStateTracker tracker,
+        string videoId,
+        CancellationToken ct)
+    {
+        try
+        {
+            await session.SendAsync("getNowPlaying", null, ct).ConfigureAwait(false);
+        }
+        catch (TvException)
+        {
+            // The read-back is a bonus; its failure must not replace the real reason
+            // the primary observation did not confirm.
+            return null;
+        }
+
+        return await ObserveAsync(
+            subscription,
+            tracker,
+            state => string.Equals(state.VideoId, videoId, StringComparison.Ordinal)
+                     && state.State is LoungePlayerState.Playing,
+            _options.LoungeSubscribeTimeoutSeconds,
+            ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -474,18 +549,32 @@ public sealed class TvControlService
     /// the type makes it impossible to reach observation without having opened the
     /// stream first, so the command-before-subscribe ordering cannot come back.
     /// </summary>
-    private async Task<LoungeReceiverState?> ObserveAsync(
+    private Task<LoungeReceiverState?> ObserveAsync(
         ILoungeSubscription subscription,
         Func<LoungeReceiverState, bool> predicate,
+        CancellationToken ct) =>
+        ObserveAsync(subscription, tracker: null, predicate, _options.LoungeVerifyTimeoutSeconds, ct);
+
+    private async Task<LoungeReceiverState?> ObserveAsync(
+        ILoungeSubscription subscription,
+        ReceiverStateTracker? tracker,
+        Func<LoungeReceiverState, bool> predicate,
+        int timeoutSeconds,
         CancellationToken ct)
     {
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        budget.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, _options.LoungeVerifyTimeoutSeconds)));
+        budget.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds)));
 
         try
         {
-            await foreach (var state in subscription.ReadAsync(budget.Token).ConfigureAwait(false))
+            await foreach (var report in subscription.ReadAsync(budget.Token).ConfigureAwait(false))
             {
+                // Folded when the caller is correlating across events, taken as-is
+                // otherwise — commands judged on a state alone need no correlation.
+                var state = tracker is null ? report : tracker.Apply(report);
+
+                LogReceiverEvent(report, state);
+
                 if (predicate(state))
                 {
                     return state;
@@ -498,6 +587,33 @@ public sealed class TvControlService
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Records what the receiver announced, which is otherwise invisible when a
+    /// verification fails and the only evidence is "nothing matched".
+    ///
+    /// Carries the event name, the state and the video id — and nothing else. The
+    /// Lounge token and the subscription URI that contains it are NEVER logged; the
+    /// whole point of keeping the token out of the command path was so that request
+    /// logging could not print it, and a diagnostic that reintroduced it here would
+    /// undo that.
+    /// </summary>
+    private void LogReceiverEvent(LoungeReceiverState report, LoungeReceiverState correlated)
+    {
+        if (!_logger.IsEnabled(LogLevel.Debug))
+        {
+            return;
+        }
+
+        _logger.LogDebug(
+            "Lounge event {Event}: reported video={ReportedVideoId} state={ReportedState}; " +
+            "correlated video={VideoId} state={State}.",
+            report.EventName ?? "unnamed",
+            report.VideoId ?? "(none)",
+            report.State,
+            correlated.VideoId ?? "(none)",
+            correlated.State);
     }
 
     // ------------------------------------------------- youtube receiver control

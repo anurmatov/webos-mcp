@@ -675,15 +675,18 @@ internal sealed class LoungeSession : ILoungeSession
                 Text(data, "videoId"),
                 ParseState(Text(data, "state")),
                 Number(data, "currentTime"),
-                Number(data, "duration")),
+                Number(data, "duration"),
+                EventName: name),
 
             "onVolumeChanged" => new LoungeReceiverState(
-                Volume: Number(data, "volume") is { } v ? (int)v : null),
+                Volume: Number(data, "volume") is { } v ? (int)v : null,
+                EventName: name),
 
             "autoplayModeChanged" or "onAutoplayModeChanged" => new LoungeReceiverState(
                 AutoplayEnabled: Text(data, "autoplayMode") is { } mode
                     ? mode.Equals("ENABLED", StringComparison.OrdinalIgnoreCase)
-                    : null),
+                    : null,
+                EventName: name),
 
             _ => null,
         };

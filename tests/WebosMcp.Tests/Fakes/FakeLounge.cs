@@ -24,8 +24,16 @@ public sealed class FakeLoungeSession : ILoungeSession
 {
     private readonly List<FakeLoungeSubscription> _open = [];
 
-    /// <summary>Reports the receiver announces when a command reaches it.</summary>
+    /// <summary>Reports the receiver announces when any command reaches it.</summary>
     public List<LoungeReceiverState> Reports { get; } = [];
+
+    /// <summary>
+    /// Reports announced only in response to one specific command. Lets a test model
+    /// a receiver that misses its own spontaneous announcement but still answers a
+    /// direct <c>getNowPlaying</c> — which is exactly when the read-back fallback is
+    /// supposed to earn its place.
+    /// </summary>
+    public Dictionary<string, List<LoungeReceiverState>> ReportsByCommand { get; } = [];
 
     public List<SentCommand> Sent { get; } = [];
 
@@ -68,9 +76,13 @@ public sealed class FakeLoungeSession : ILoungeSession
         // Announced only to subscriptions that are ACTIVELY PUMPING. One that merely
         // exists — stream open, nothing reading — has nobody to hand the
         // announcement to and drops it, exactly as on the real receiver.
+        var announced = ReportsByCommand.TryGetValue(command, out var forCommand)
+            ? Reports.Concat(forCommand)
+            : Reports;
+
         foreach (var subscription in _open)
         {
-            foreach (var report in Reports)
+            foreach (var report in announced)
             {
                 subscription.Announce(report);
             }

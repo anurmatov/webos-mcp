@@ -113,6 +113,128 @@ public sealed class YouTubeLoungeTests
         Assert.True(result.ExactVideoConfirmed);
     }
 
+    // ---- the id and the playing state arrive SEPARATELY --------------------
+
+    [Fact]
+    public async Task The_id_from_nowPlaying_and_a_later_id_less_Playing_together_confirm()
+    {
+        // How the receiver actually announces it, and the reason this tool
+        // false-negatived on hardware: nowPlaying carries the video id while it is
+        // still buffering, and the playing state arrives afterwards in its own event
+        // WITH NO VIDEO ID. Demanding both in one report can never match, so a video
+        // visibly playing on the TV was reported as never observed.
+        var harness = Ready(
+            new LoungeReceiverState(Video, LoungePlayerState.Buffering),
+            new LoungeReceiverState(VideoId: null, LoungePlayerState.Playing));
+
+        var result = await harness.Control.PlayYouTubeAsync(Video, CancellationToken.None);
+
+        Assert.True(result.ExactVideoConfirmed);
+        Assert.Equal(Video, result.ObservedVideoId);
+        Assert.Equal("Playing", result.ObservedState);
+        Assert.Equal("event stream", result.ConfirmedVia);
+    }
+
+    [Fact]
+    public async Task An_id_less_Playing_after_a_DIFFERENT_video_is_not_our_confirmation()
+    {
+        // The correlation must not be so eager that it manufactures a success. An
+        // id-less playing state belongs to whatever was last announced — here another
+        // video — and attributing it to the requested one would be the original
+        // wrong-video bug wearing the fix as a disguise.
+        var harness = Ready(
+            new LoungeReceiverState(Other, LoungePlayerState.Buffering),
+            new LoungeReceiverState(VideoId: null, LoungePlayerState.Playing));
+
+        var error = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvError, error.Code);
+    }
+
+    [Fact]
+    public async Task A_newly_announced_video_does_not_inherit_the_previous_playing_state()
+    {
+        // Playing, then the requested video is announced as merely cued. Carrying the
+        // earlier state forward would confirm a video that has not started.
+        var harness = Ready(
+            new LoungeReceiverState(Other, LoungePlayerState.Playing),
+            new LoungeReceiverState(Video, LoungePlayerState.Cued));
+
+        await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task The_requested_video_announced_with_NO_state_is_not_confirmed_by_the_previous_one()
+    {
+        // nowPlaying often carries an id and no state field. Inheriting the previous
+        // video's Playing across that would report success the instant the requested
+        // video was merely announced — the wrong-video bug, restored through the fix.
+        var harness = Ready(
+            new LoungeReceiverState(Other, LoungePlayerState.Playing),
+            new LoungeReceiverState(Video));
+
+        await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task An_id_less_Playing_before_anything_was_announced_confirms_nothing()
+    {
+        // Unattributable: there is no video it could belong to.
+        var harness = Ready(new LoungeReceiverState(VideoId: null, LoungePlayerState.Playing));
+
+        await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+    }
+
+    // ---- the read-back is defense in depth, never the primary path ---------
+
+    [Fact]
+    public async Task A_missed_announcement_is_recovered_by_the_bounded_read_back()
+    {
+        // The receiver announces nothing spontaneously but answers a direct question.
+        // The read-back exists for exactly this, and the result says so rather than
+        // presenting it as the event stream having confirmed.
+        var harness = new TestHarness();
+        harness.Lounge.Session!.ReportsByCommand["getNowPlaying"] =
+            [new LoungeReceiverState(Video, LoungePlayerState.Playing)];
+
+        var result = await harness.Control.PlayYouTubeAsync(Video, CancellationToken.None);
+
+        Assert.True(result.ExactVideoConfirmed);
+        Assert.Equal("getNowPlaying read-back", result.ConfirmedVia);
+        Assert.Equal(["subscribe", "send:setPlaylist", "send:getNowPlaying"],
+            harness.Lounge.Session.Interactions);
+    }
+
+    [Fact]
+    public async Task The_read_back_holds_the_SAME_rule_and_cannot_confirm_another_video()
+    {
+        // A fallback that relaxed the rule would be worse than no fallback: it would
+        // turn the original wrong-video failure back into a reported success.
+        var harness = new TestHarness();
+        harness.Lounge.Session!.ReportsByCommand["getNowPlaying"] =
+            [new LoungeReceiverState(Other, LoungePlayerState.Playing)];
+
+        await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task The_read_back_is_not_used_when_the_event_stream_already_confirmed()
+    {
+        // Secondary means secondary. A successful observation must not send an extra
+        // command to the receiver.
+        var harness = Ready(Playing(Video));
+
+        var result = await harness.Control.PlayYouTubeAsync(Video, CancellationToken.None);
+
+        Assert.Equal("event stream", result.ConfirmedVia);
+        Assert.Equal("setPlaylist", Assert.Single(harness.Lounge.Session!.Sent).Command);
+    }
+
     // ---- the command never precedes the subscription -----------------------
 
     [Fact]

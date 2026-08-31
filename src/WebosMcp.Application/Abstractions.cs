@@ -148,7 +148,78 @@ public sealed record LoungeReceiverState(
     double? CurrentTime = null,
     double? Duration = null,
     int? Volume = null,
-    bool? AutoplayEnabled = null);
+    bool? AutoplayEnabled = null,
+    string? EventName = null);
+
+/// <summary>
+/// Folds the receiver's reports into one running picture of what is playing.
+///
+/// The receiver does NOT announce "video X is now playing" in a single event. It
+/// sends <c>nowPlaying</c> carrying the video id — often still buffering — and then
+/// a separate <c>onStateChange</c> carrying the playing state WITH NO VIDEO ID.
+/// Requiring both in one report therefore never matches, and the tool reports a
+/// video that is visibly playing as never observed. That is a false negative, and it
+/// is the third distinct way this path produced one.
+///
+/// An id-less state report applies to the video most recently announced, so the two
+/// are correlated here rather than in a predicate that can only see one event.
+/// </summary>
+public sealed class ReceiverStateTracker
+{
+    private string? _videoId;
+    private LoungePlayerState _state = LoungePlayerState.Unknown;
+    private double? _currentTime;
+
+    /// <summary>
+    /// Applies one report and returns the composite picture after it.
+    ///
+    /// A report naming a DIFFERENT video resets the state rather than inheriting the
+    /// previous one — otherwise a stale "playing" would immediately be attributed to
+    /// a video that has only just been announced and may still be loading.
+    /// </summary>
+    public LoungeReceiverState Apply(LoungeReceiverState report)
+    {
+        if (report.VideoId is { Length: > 0 } id)
+        {
+            if (!string.Equals(id, _videoId, StringComparison.Ordinal))
+            {
+                _videoId = id;
+                _state = report.State;
+                _currentTime = report.CurrentTime;
+            }
+            else
+            {
+                if (report.State != LoungePlayerState.Unknown)
+                {
+                    _state = report.State;
+                }
+
+                _currentTime = report.CurrentTime ?? _currentTime;
+            }
+        }
+        else if (report.State != LoungePlayerState.Unknown)
+        {
+            // Applies to whatever was last announced. With nothing announced yet it
+            // is deliberately unattributable — _videoId stays null and no request
+            // can match it.
+            _state = report.State;
+            _currentTime = report.CurrentTime ?? _currentTime;
+        }
+        else
+        {
+            _currentTime = report.CurrentTime ?? _currentTime;
+        }
+
+        return new LoungeReceiverState(
+            _videoId,
+            _state,
+            _currentTime,
+            report.Duration,
+            report.Volume,
+            report.AutoplayEnabled,
+            report.EventName);
+    }
+}
 
 /// <summary>YouTube receiver player states, as the Lounge protocol reports them.</summary>
 public enum LoungePlayerState

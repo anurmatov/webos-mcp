@@ -28,6 +28,7 @@ public sealed class TestHarness
             LaunchVerifyTimeoutSeconds = 6,
             LaunchPollIntervalSeconds = 2,
             LoungeVerifyTimeoutSeconds = 1,
+            LoungeSubscribeTimeoutSeconds = 1,
         };
 
         configure?.Invoke(Options);

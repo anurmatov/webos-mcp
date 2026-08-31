@@ -426,6 +426,26 @@ cannot do the job:
 requested video id in a playing state. A different video, a merely cued or paused
 one, or a silent receiver are all reported as failures.
 
+Two details of *how* that report is read, both of which caused false negatives:
+
+- **The id and the playing state arrive in separate events.** The receiver sends
+  `nowPlaying` carrying the video id — usually still buffering — and then
+  `onStateChange` carrying the playing state with **no video id at all**. The server
+  correlates them: an id-less state applies to the video most recently announced.
+  Announcing a *new* id resets that state rather than inheriting the previous one, so
+  a stale "playing" can never be attributed to a video that has only just appeared.
+- **Something must already be reading when the command goes out.** The receiver
+  announces once, to whoever is listening at that instant. The event stream is opened
+  and actively pumped before `setPlaylist` is sent; response headers coming back is
+  *not* treated as readiness, because nothing is reading the body at that point.
+
+If the announcement is missed anyway, one bounded `getNowPlaying` read-back asks the
+receiver directly. It is **defense in depth only** — it is judged by the identical
+requested-id-plus-playing rule, so it can recover a missed event but can never turn a
+wrong video into a success. The response's `confirmedVia` field names which path
+actually confirmed, so a run that needed the fallback is visible as such rather than
+blurred into the normal case.
+
 **Read the `observed` field.** Every YouTube control response carries it:
 
 - `observed: true` — the receiver confirmed the effect by reporting its own state.
