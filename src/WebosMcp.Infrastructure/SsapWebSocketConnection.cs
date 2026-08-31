@@ -480,6 +480,12 @@ public sealed class SsapWebSocketConnection : ISsapConnection
         text.Contains("unauthorized", StringComparison.OrdinalIgnoreCase) ||
         text.Contains("forbidden", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Classification reads the RAW text — a control character must not be able to
+    /// hide the word it sits inside — but every message built from it goes through
+    /// <see cref="TvException.SanitizeDetail"/>, so nothing raw reaches a caller or
+    /// a log line.
+    /// </summary>
     private static TvException MapCapabilityOrGeneric(string text)
     {
         if (text.Contains("404", StringComparison.Ordinal) ||
@@ -488,10 +494,10 @@ public sealed class SsapWebSocketConnection : ISsapConnection
             text.Contains("unsupported", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("not exist", StringComparison.OrdinalIgnoreCase))
         {
-            return new TvException(TvErrorCode.TvUnsupportedCapability, $"The TV reported: {text}");
+            return TvException.Reported(TvErrorCode.TvUnsupportedCapability, text);
         }
 
-        return new TvException(TvErrorCode.TvError, $"The TV reported: {text}");
+        return TvException.Reported(TvErrorCode.TvError, text);
     }
 
     private void FaultAll(Exception exception)

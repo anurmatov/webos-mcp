@@ -591,6 +591,16 @@ They are now separated by which frame failed:
   `TV_PERMISSION_DENIED`, carrying the TV's own wording, which is what
   distinguishes one denied capability from another.
 
+**That wording is sanitised before it is used.** It arrives from the network, so
+it reaches a caller's response and a log line as text this server did not author.
+Control characters — newlines that would forge a second log entry, ANSI escapes
+that would rewrite a terminal, NULs that would truncate a consumer — are collapsed
+to spaces, and the detail is capped at 200 characters. Classification still reads
+the raw text, so a control character cannot hide the word it sits inside.
+Sanitising neutralises *structure*, not content: ordinary wording such as
+`401 insufficient permissions` passes through unchanged, because naming the
+refused capability is the whole reason the detail is kept.
+
 ### Changing the permission set requires an explicit re-pair
 
 The TV grants a key against the permission manifest presented at pairing time.

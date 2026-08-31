@@ -148,8 +148,10 @@ public sealed class ErrorContractTests
             Assert.NotEqual(TvErrorCode.PairingRequired, mapped.Code);
             Assert.Equal(TvErrorCode.TvPermissionDenied, mapped.Code);
 
-            // The TV's own wording survives: it is what distinguishes one denied
-            // capability from another.
+            // The TV's own wording survives SANITISATION unchanged when it is
+            // ordinary text — which is what distinguishes one denied capability
+            // from another, and the reason the detail is kept at all. Hostile
+            // wording is neutralised instead; see SanitisedDetailTests.
             Assert.Contains(detail, mapped.Message, StringComparison.Ordinal);
             Assert.DoesNotContain("No valid client key", mapped.Message, StringComparison.Ordinal);
         }
