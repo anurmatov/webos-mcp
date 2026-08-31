@@ -39,12 +39,13 @@ public sealed class TestHarness
         Delay = new InstantDelayProvider();
         Dial = new FakeDialClient();
         Lounge = new FakeLoungeClient();
+        Downloader = new FakeScreenshotDownloader();
 
         var wrapped = Microsoft.Extensions.Options.Options.Create(Options);
 
         Session = new TvSession(Factory, KeyStore, wrapped, LoggerFactory.CreateLogger<TvSession>());
         Control = new TvControlService(
-            Session, Delay, Dial, Lounge, wrapped, LoggerFactory.CreateLogger<TvControlService>());
+            Session, Delay, Dial, Lounge, Downloader, wrapped, LoggerFactory.CreateLogger<TvControlService>());
         Power = new PowerService(Wol, Control, Delay, wrapped, LoggerFactory.CreateLogger<PowerService>());
     }
 
@@ -63,6 +64,8 @@ public sealed class TestHarness
     public FakeDialClient Dial { get; }
 
     public FakeLoungeClient Lounge { get; }
+
+    public FakeScreenshotDownloader Downloader { get; }
 
     public ILoggerFactory LoggerFactory { get; }
 

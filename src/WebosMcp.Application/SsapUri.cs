@@ -32,6 +32,13 @@ internal static class SsapUri
     public const string MediaRewind = "ssap://media.controls/rewind";
     public const string MediaFastForward = "ssap://media.controls/fastForward";
 
+    /// <summary>
+    /// Undocumented by LG and model/firmware dependent. Returns an
+    /// <c>imageUri</c> the TV serves the captured frame from; the TV is trusted
+    /// for neither the URI nor the bytes behind it.
+    /// </summary>
+    public const string ExecuteOneShot = "ssap://tv/executeOneShot";
+
     public const string GetExternalInputList = "ssap://tv/getExternalInputList";
     public const string SwitchInput = "ssap://tv/switchInput";
     public const string GetCurrentChannel = "ssap://tv/getCurrentChannel";

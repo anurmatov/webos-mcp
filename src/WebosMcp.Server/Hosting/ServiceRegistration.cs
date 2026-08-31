@@ -1,10 +1,24 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using WebosMcp.Application;
 using WebosMcp.Infrastructure;
 using WebosMcp.Server.Tools;
 
 namespace WebosMcp.Server.Hosting;
+
+/// <summary>
+/// Turns an out-of-range screenshot limit into a startup failure that names the
+/// offending value. A generic "configuration is invalid" would leave an operator
+/// guessing which of two settings is wrong, and the range it should be in.
+/// </summary>
+public sealed class ScreenshotLimitsValidator : IValidateOptions<WebosMcpOptions>
+{
+    public ValidateOptionsResult Validate(string? name, WebosMcpOptions options) =>
+        options.ValidateScreenshotLimits() is { } problem
+            ? ValidateOptionsResult.Fail(problem)
+            : ValidateOptionsResult.Success;
+}
 
 public static class ServiceRegistration
 {
@@ -16,6 +30,12 @@ public static class ServiceRegistration
     public static IServiceCollection AddWebosMcp(this IServiceCollection services, IConfiguration configuration)
     {
         services.Configure<WebosMcpOptions>(configuration.GetSection(WebosMcpOptions.SectionName));
+
+        // Fail the server at startup on an out-of-range screenshot limit, rather
+        // than at the first capture. A bound that is only checked when it is first
+        // used is a bound nobody finds out is broken until it matters.
+        services.AddSingleton<IValidateOptions<WebosMcpOptions>, ScreenshotLimitsValidator>();
+        services.AddOptions<WebosMcpOptions>().ValidateOnStart();
 
         services.AddSingleton<ISsapConnectionFactory, SsapConnectionFactory>();
         services.AddSingleton<IWolSender, UdpWolSender>();
@@ -45,6 +65,34 @@ public static class ServiceRegistration
             client.Timeout = TimeSpan.FromSeconds(60);
             client.DefaultRequestHeaders.UserAgent.ParseAdd("webos-mcp/1.0");
         });
+
+        // The screenshot download gets its OWN client and its own primary handler.
+        // Two properties depend on that isolation and would be wrong on a shared
+        // one: redirects are followed manually so every hop can be re-pinned to the
+        // TV, and a self-signed certificate is tolerated ONLY for the selected TV's
+        // host. Neither leaks to the DIAL or Lounge clients, and TLS validation is
+        // never globally disabled.
+        services
+            .AddHttpClient<IScreenshotDownloader, ScreenshotDownloader>(client =>
+            {
+                // The downloader applies its own bounded timeout; a second,
+                // independent one here would report the wrong failure.
+                client.Timeout = Timeout.InfiniteTimeSpan;
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("webos-mcp/1.0");
+            })
+            .ConfigurePrimaryHttpMessageHandler(provider =>
+            {
+                var options = provider.GetRequiredService<
+                    Microsoft.Extensions.Options.IOptions<WebosMcpOptions>>();
+
+                return new HttpClientHandler
+                {
+                    AllowAutoRedirect = false,
+                    ServerCertificateCustomValidationCallback = (request, _, _, errors) =>
+                        errors == System.Net.Security.SslPolicyErrors.None ||
+                        ScreenshotPolicy.IsSelectedTvHost(request.RequestUri, options.Value),
+                };
+            });
 
         services.AddSingleton<IDelayProvider, RealDelayProvider>();
 

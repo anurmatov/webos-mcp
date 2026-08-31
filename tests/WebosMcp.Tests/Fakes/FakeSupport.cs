@@ -61,6 +61,33 @@ public sealed class FakeWolSender : IWolSender
     }
 }
 
+/// <summary>
+/// Stands in for the capture download. Defaults to a REAL, decode-verified JPEG
+/// (see <see cref="ImageFixtures"/>) so no test can reach the network, and so the
+/// default success path proves a usable image rather than a magic-number prefix.
+/// </summary>
+public sealed class FakeScreenshotDownloader : IScreenshotDownloader
+{
+    public List<Uri> Requested { get; } = [];
+
+    public byte[] Body { get; set; } = ImageFixtures.Jpeg;
+
+    /// <summary>Thrown instead of returning a body, when set.</summary>
+    public Exception? Failure { get; set; }
+
+    public Task<ReadOnlyMemory<byte>> DownloadAsync(Uri imageUri, CancellationToken cancellationToken)
+    {
+        Requested.Add(imageUri);
+
+        if (Failure is not null)
+        {
+            throw Failure;
+        }
+
+        return Task.FromResult<ReadOnlyMemory<byte>>(Body);
+    }
+}
+
 /// <summary>Completes immediately so bounded fallback and poll loops run instantly in CI.</summary>
 public sealed class InstantDelayProvider : IDelayProvider
 {
