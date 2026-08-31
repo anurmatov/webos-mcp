@@ -3,6 +3,7 @@ using System.Web;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using WebosMcp.Application;
+using WebosMcp.Domain;
 using WebosMcp.Infrastructure;
 using WebosMcp.Tests.Fakes;
 using Xunit;
@@ -231,11 +232,9 @@ public sealed class LoungeBindShapeTests
         var (client, http) = Build();
         var session = await client.ConnectAsync(ScreenId, CancellationToken.None);
 
-        using var stop = new CancellationTokenSource();
-        await foreach (var _ in session!.ObserveAsync(stop.Token))
-        {
-            break;
-        }
+        // Subscribing is what issues the poll — it returns only once the receiver has
+        // accepted it, so the request is on the wire by the time this line completes.
+        await using var subscription = await session!.SubscribeAsync(CancellationToken.None);
 
         var query = Query(http.Requests[2].Url);
 
@@ -251,6 +250,62 @@ public sealed class LoungeBindShapeTests
         Assert.Equal("0", query["CI"]);
         Assert.Equal("xmlhttp", query["TYPE"]);
         Assert.Equal("0", query["AID"]);
+    }
+
+    [Fact]
+    public async Task Subscribing_issues_the_poll_BEFORE_it_returns()
+    {
+        // The readiness barrier, at the wire. Subscribing must not hand back a lazy
+        // stream that opens on first read: the caller sends its command the moment
+        // this returns, and an unopened stream would put the poll after the command
+        // again. A lazy implementation leaves only two requests here.
+        var (client, http) = Build();
+        var session = await client.ConnectAsync(ScreenId, CancellationToken.None);
+
+        await using var subscription = await session!.SubscribeAsync(CancellationToken.None);
+
+        Assert.Equal(3, http.Requests.Count);
+        Assert.Contains("TYPE=xmlhttp", http.Requests[2].Url, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task The_poll_is_on_the_wire_before_the_command_that_follows_it()
+    {
+        // The ordering the physical fault turned on, asserted against request order
+        // rather than call order — the two can diverge if the poll is opened lazily.
+        var (client, http) = Build();
+        var session = await client.ConnectAsync(ScreenId, CancellationToken.None);
+
+        await using var subscription = await session!.SubscribeAsync(CancellationToken.None);
+        await session.SendAsync("setPlaylist", new Dictionary<string, string>(), CancellationToken.None);
+
+        Assert.Contains("TYPE=xmlhttp", http.Requests[2].Url, StringComparison.Ordinal);
+        Assert.Contains("req0__sc=setPlaylist", http.Requests[3].Body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_refused_poll_reports_failure_rather_than_a_stream_that_observes_nothing()
+    {
+        // A subscription that cannot be established has to fail loudly: the caller
+        // sends its command next, and a silently dead stream would turn that into an
+        // unverifiable command reported as never observed.
+        var http = new CapturingLoungeHandler(
+            (HttpStatusCode.OK, $$"""{"screens":[{"screenId":"{{ScreenId}}","loungeToken":"{{Token}}"}]}"""),
+            (HttpStatusCode.OK, BindResponse()),
+            (HttpStatusCode.Forbidden, string.Empty));
+
+        var client = new LoungeClient(
+            new HttpClient(http),
+            Options.Create(new WebosMcpOptions { LoungeDeviceName = "webos-mcp-test" }),
+            NullLoggerFactory.Instance,
+            NullLogger<LoungeClient>.Instance);
+
+        var session = await client.ConnectAsync(ScreenId, CancellationToken.None);
+
+        var error = await Assert.ThrowsAsync<TvException>(
+            () => session!.SubscribeAsync(CancellationToken.None));
+
+        Assert.Contains("event stream", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

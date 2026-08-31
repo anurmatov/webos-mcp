@@ -62,6 +62,7 @@ public sealed class LoungeClient : ILoungeClient
             token,
             screenId,
             _options.LoungeDeviceName,
+            _options.LoungeSubscribeTimeoutSeconds,
             _loggerFactory.CreateLogger<LoungeSession>());
 
         if (!await session.BindAsync(cancellationToken).ConfigureAwait(false))
@@ -157,6 +158,7 @@ internal sealed class LoungeSession : ILoungeSession
     private readonly string _loungeToken;
     private readonly string _screenId;
     private readonly string _deviceName;
+    private readonly int _subscribeTimeoutSeconds;
     private readonly ILogger<LoungeSession> _logger;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
@@ -171,6 +173,7 @@ internal sealed class LoungeSession : ILoungeSession
         string loungeToken,
         string screenId,
         string deviceName,
+        int subscribeTimeoutSeconds,
         ILogger<LoungeSession> logger)
     {
         _http = http;
@@ -178,6 +181,7 @@ internal sealed class LoungeSession : ILoungeSession
         _loungeToken = loungeToken;
         _screenId = screenId;
         _deviceName = deviceName;
+        _subscribeTimeoutSeconds = subscribeTimeoutSeconds;
         _logger = logger;
     }
 
@@ -315,64 +319,48 @@ internal sealed class LoungeSession : ILoungeSession
         }
     }
 
-    public async IAsyncEnumerable<LoungeReceiverState> ObserveAsync(
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+    /// <summary>
+    /// Opens the event stream and returns only once the receiver has ACCEPTED the
+    /// poll — response headers back, success status. That acceptance is the readiness
+    /// barrier: from the moment this returns, the channel is registered server-side
+    /// and anything the receiver announces lands on a stream that is already open.
+    ///
+    /// This exists because the opposite order silently loses events. The receiver
+    /// announces a state change once, as it happens; a poll opened after the command
+    /// can miss the announcement entirely, and the tool then reports a video that is
+    /// visibly playing as never observed. A sleep between command and poll would not
+    /// fix it either — it asserts that enough time has passed rather than confirming
+    /// the stream is open, so it is both slower and still a race.
+    /// </summary>
+    public async Task<ILoungeSubscription> SubscribeAsync(CancellationToken cancellationToken)
     {
-        var lastEventId = 0;
+        // Bounded on its own, separate from the verification budget: failing to open
+        // the stream means nothing was sent to the receiver at all, which is a
+        // different report from a command that went out unconfirmed.
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, _subscribeTimeoutSeconds)));
 
-        while (!cancellationToken.IsCancellationRequested)
+        var poll = await OpenPollAsync(0, budget.Token).ConfigureAwait(false);
+
+        if (poll is null)
         {
-            var poll = await OpenPollAsync(lastEventId, cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
 
-            if (poll is null)
-            {
-                yield break;
-            }
-
-            using var response = poll.Value.Response;
-            await using var stream = poll.Value.Stream;
-
-            // Parsed INCREMENTALLY. This is a long poll: it stays open feeding events
-            // as they happen, so waiting for the response to end means waiting for the
-            // server to close it. That is why playback the receiver really did start
-            // was never observed inside the verification window — the video was
-            // playing and the report simply had not been read yet.
-            var chunks = new LoungeChunkStream();
-            var buffer = new byte[8192];
-            var readAny = false;
-
-            while (true)
-            {
-                var read = await ReadAsync(stream, buffer, cancellationToken).ConfigureAwait(false);
-
-                if (read <= 0)
-                {
-                    break;
-                }
-
-                readAny = true;
-
-                foreach (var state in chunks.Append(buffer.AsSpan(0, read)))
-                {
-                    yield return state;
-                }
-            }
-
-            lastEventId = Math.Max(lastEventId, chunks.LastEventId);
-
-            if (!readAny)
-            {
-                // The channel closed with nothing at all; re-polling would spin.
-                yield break;
-            }
+            throw new TvException(
+                TvErrorCode.TvError,
+                "The YouTube receiver did not open its event stream within " +
+                $"{Math.Max(1, _subscribeTimeoutSeconds)}s, so nothing it was asked to do could be " +
+                "verified. No command was sent.");
         }
+
+        return new LoungeSubscription(this, poll.Value.Response, poll.Value.Stream);
     }
 
     /// <summary>
     /// Opens one long poll. Separated from the iterator because a catch block cannot
     /// contain a yield, and swallowing the failure inline would hide it.
     /// </summary>
-    private async Task<(HttpResponseMessage Response, Stream Stream)?> OpenPollAsync(
+    internal async Task<(HttpResponseMessage Response, Stream Stream)?> OpenPollAsync(
         int lastEventId,
         CancellationToken cancellationToken)
     {
@@ -408,7 +396,7 @@ internal sealed class LoungeSession : ILoungeSession
     }
 
     /// <summary>Reads the next block, or -1 when the stream ends or faults.</summary>
-    private static async Task<int> ReadAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
+    internal static async Task<int> ReadAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
     {
         try
         {
@@ -688,5 +676,132 @@ internal sealed class LoungeSession : ILoungeSession
     {
         _sendLock.Dispose();
         return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>
+/// An event stream that was already open before the command it observes was sent.
+///
+/// The first poll is handed over ALREADY OPEN by <see cref="LoungeSession.SubscribeAsync"/>
+/// — that is what makes the ordering guarantee real rather than nominal. Reading
+/// lazily here instead would put the open back after the command and restore the
+/// exact race this closes, because an iterator body does not begin executing until
+/// its first enumeration.
+/// </summary>
+internal sealed class LoungeSubscription : ILoungeSubscription
+{
+    private readonly LoungeSession _session;
+
+    private HttpResponseMessage? _response;
+    private Stream? _stream;
+    private int _lastEventId;
+
+    public LoungeSubscription(LoungeSession session, HttpResponseMessage response, Stream stream)
+    {
+        _session = session;
+        _response = response;
+        _stream = stream;
+    }
+
+    public async IAsyncEnumerable<LoungeReceiverState> ReadAsync(
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        // Taken, not copied: the established poll is consumed exactly once, and
+        // disposal must not close a stream this loop still owns.
+        var response = Interlocked.Exchange(ref _response, null);
+        var stream = Interlocked.Exchange(ref _stream, null);
+
+        // try/finally rather than `using` on the locals: the established poll is
+        // taken out of the fields above, so an exit that never enters the loop —
+        // an already-cancelled token, or the consumer abandoning the enumerator —
+        // would otherwise leave it open with nothing left holding a reference to it.
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                if (response is null || stream is null)
+                {
+                    // Only reached after the established poll ends; the receiver
+                    // closes long polls periodically and expects a fresh one.
+                    var poll = await _session
+                        .OpenPollAsync(_lastEventId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (poll is null)
+                    {
+                        yield break;
+                    }
+
+                    response = poll.Value.Response;
+                    stream = poll.Value.Stream;
+                }
+
+                // Parsed INCREMENTALLY. This is a long poll: it stays open feeding
+                // events as they happen, so waiting for the response to end means
+                // waiting for the server to close it. That is why playback the
+                // receiver really did start was never observed inside the
+                // verification window — the video was playing and the report simply
+                // had not been read yet.
+                var chunks = new LoungeChunkStream();
+                var buffer = new byte[8192];
+                var readAny = false;
+
+                while (true)
+                {
+                    var read = await LoungeSession
+                        .ReadAsync(stream, buffer, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (read <= 0)
+                    {
+                        break;
+                    }
+
+                    readAny = true;
+
+                    foreach (var state in chunks.Append(buffer.AsSpan(0, read)))
+                    {
+                        yield return state;
+                    }
+                }
+
+                _lastEventId = Math.Max(_lastEventId, chunks.LastEventId);
+
+                await ClosePollAsync(response, stream).ConfigureAwait(false);
+                response = null;
+                stream = null;
+
+                if (!readAny)
+                {
+                    // The channel closed with nothing at all; re-polling would spin.
+                    yield break;
+                }
+            }
+        }
+        finally
+        {
+            await ClosePollAsync(response, stream).ConfigureAwait(false);
+        }
+    }
+
+    private static async ValueTask ClosePollAsync(HttpResponseMessage? response, Stream? stream)
+    {
+        if (stream is not null)
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+        }
+
+        response?.Dispose();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        // Non-null only when the stream was established and never read — an early
+        // failure between subscribing and sending. Leaving it open would hold a poll
+        // against the receiver for nothing. Once reading starts these are null and
+        // the reader's own finally owns the cleanup.
+        await ClosePollAsync(
+            Interlocked.Exchange(ref _response, null),
+            Interlocked.Exchange(ref _stream, null)).ConfigureAwait(false);
     }
 }

@@ -179,10 +179,32 @@ public interface ILoungeSession : IAsyncDisposable
         CancellationToken cancellationToken);
 
     /// <summary>
-    /// The receiver's own state reports, as they arrive. This is the observation
-    /// every YouTube tool's success is proven against.
+    /// Opens the receiver's event stream and returns only once it is ESTABLISHED —
+    /// the receiver has accepted the poll and is feeding it.
+    ///
+    /// The ordering this enables is the whole point: a command must never be sent
+    /// before the stream that will report its effect is open. The receiver announces
+    /// a state change once, as it happens, so a subscription opened afterwards can
+    /// miss it entirely — which is how a video that really did start playing was
+    /// reported as never observed. This returning is the readiness barrier; there is
+    /// deliberately no sleep anywhere near it, because a sleep asserts a delay rather
+    /// than confirming a fact.
     /// </summary>
-    IAsyncEnumerable<LoungeReceiverState> ObserveAsync(CancellationToken cancellationToken);
+    Task<ILoungeSubscription> SubscribeAsync(CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// An event stream that is already open. Obtained before the command whose effect
+/// it is meant to observe, so nothing the receiver announces can fall between them.
+/// </summary>
+public interface ILoungeSubscription : IAsyncDisposable
+{
+    /// <summary>
+    /// The receiver's own state reports, as they arrive on the stream that was
+    /// already open. This is the observation every YouTube tool's success is proven
+    /// against.
+    /// </summary>
+    IAsyncEnumerable<LoungeReceiverState> ReadAsync(CancellationToken cancellationToken);
 }
 
 public interface ILoungeClient

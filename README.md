@@ -314,6 +314,7 @@ network normally cannot receive it. Step 4 is last for that reason.
 | `WEBOSMCP__LOUNGEBASEURL` | `https://www.youtube.com` | YouTube Lounge service. The one outbound-internet dependency. |
 | `WEBOSMCP__LOUNGEDEVICENAME` | `webos-mcp` | Name this remote presents to the receiver. |
 | `WEBOSMCP__LOUNGEVERIFYTIMEOUTSECONDS` | `30` | How long to wait for the receiver to confirm a command. |
+| `WEBOSMCP__LOUNGESUBSCRIBETIMEOUTSECONDS` | `10` | How long to wait for the receiver's event stream to open, before any command is sent. Bounded separately from verification: a stream that never opened means nothing was sent, which is a different failure from a command that went out unconfirmed. |
 | `WEBOSMCP__DEVICESTOREPATH` | `~/.webos-mcp/devices.json` | Where registered devices are stored. Must be writable to register a TV. |
 
 To find the right value for a stubborn TV, run `M-SEARCH` from a host on the

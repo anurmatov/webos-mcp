@@ -113,6 +113,92 @@ public sealed class YouTubeLoungeTests
         Assert.True(result.ExactVideoConfirmed);
     }
 
+    // ---- the command never precedes the subscription -----------------------
+
+    [Fact]
+    public async Task The_event_subscription_is_established_BEFORE_setPlaylist_is_sent()
+    {
+        // The physical fault this closes: setPlaylist went out first and the event
+        // stream opened afterwards, so the receiver's announcement of the new video
+        // could land in the gap. The video really played; the tool reported it never
+        // did. Ordering is the fix, and this is the assertion that holds it.
+        var harness = Ready(Playing(Video));
+
+        await harness.Control.PlayYouTubeAsync(Video, CancellationToken.None);
+
+        Assert.Equal(["subscribe", "send:setPlaylist"], harness.Lounge.Session!.Interactions);
+    }
+
+    [Fact]
+    public async Task A_receiver_that_only_announces_to_streams_open_at_command_time_is_still_observed()
+    {
+        // The same guarantee stated as behaviour rather than call order, so it holds
+        // even if the ordering assertion above is edited. The fake receiver announces
+        // only to subscriptions already open when the command arrives — send-first
+        // observes nothing and this test fails with a verification timeout.
+        var harness = Ready(Playing(Video));
+
+        var result = await harness.Control.PlayYouTubeAsync(Video, CancellationToken.None);
+
+        Assert.True(result.ExactVideoConfirmed);
+        Assert.Equal(Video, result.ObservedVideoId);
+    }
+
+    [Fact]
+    public async Task A_stream_that_never_opens_fails_WITHOUT_sending_the_command()
+    {
+        // Establishing the stream is a barrier, not a courtesy. If it cannot be
+        // opened there is no way to verify anything, so the receiver is left
+        // untouched rather than sent a command whose effect could never be confirmed.
+        var harness = Ready(Playing(Video));
+        harness.Lounge.Session!.SubscribeFailure =
+            new TvException(TvErrorCode.TvError, "The YouTube receiver did not open its event stream.");
+
+        await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+
+        Assert.Empty(harness.Lounge.Session.Sent);
+        Assert.Equal(["subscribe"], harness.Lounge.Session.Interactions);
+    }
+
+    [Fact]
+    public async Task Observed_control_commands_also_subscribe_before_they_send()
+    {
+        // Not just play: every command judged on an announced event has the same
+        // race, so the ordering is a property of the observed path, not of one tool.
+        var harness = Ready(new LoungeReceiverState(Video, LoungePlayerState.Paused));
+
+        await harness.Control.YouTubePauseAsync(CancellationToken.None);
+
+        Assert.Equal(["subscribe", "send:pause"], harness.Lounge.Session!.Interactions);
+    }
+
+    [Fact]
+    public async Task Now_playing_subscribes_before_asking_the_receiver_to_report()
+    {
+        // getNowPlaying is answered on the event stream, so the same ordering applies
+        // to a pure read. Note it is used here as an observation in its own right —
+        // never as a substitute for observing that a requested video started.
+        var harness = Ready(Playing(Video));
+
+        await harness.Control.YouTubeNowPlayingAsync(CancellationToken.None);
+
+        Assert.Equal(["subscribe", "send:getNowPlaying"], harness.Lounge.Session!.Interactions);
+    }
+
+    [Fact]
+    public async Task A_command_with_nothing_to_observe_opens_no_stream_at_all()
+    {
+        // Playback speed announces no confirming event, so there is nothing to
+        // subscribe to; opening a stream anyway would suggest an observation that
+        // this path deliberately does not claim.
+        var harness = Ready();
+
+        await harness.Control.YouTubeSetPlaybackSpeedAsync(1.5, CancellationToken.None);
+
+        Assert.Equal(["send:setPlaybackSpeed"], harness.Lounge.Session!.Interactions);
+    }
+
     // ---- never restart to change video -------------------------------------
 
     [Fact]

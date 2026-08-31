@@ -401,6 +401,15 @@ public sealed class TvControlService
 
         await using var session = await ConnectLoungeAsync(screenId, ct).ConfigureAwait(false);
 
+        // The event stream is established BEFORE the command, and this returning is
+        // the barrier — the receiver has accepted the poll and is feeding it. The
+        // receiver announces the video change once, as it happens, so opening the
+        // stream afterwards can miss the announcement outright: that is how a video
+        // physically playing on the TV was reported as never observed. No sleep is
+        // used or wanted here; a sleep asserts elapsed time instead of confirming the
+        // stream is open, which leaves the same race with worse latency.
+        await using var subscription = await session.SubscribeAsync(ct).ConfigureAwait(false);
+
         await session.SendAsync(
             "setPlaylist",
             new Dictionary<string, string>
@@ -414,9 +423,10 @@ public sealed class TvControlService
             ct).ConfigureAwait(false);
 
         // Acceptance is still not playback. Wait for the RECEIVER to report this
-        // video id in a playing state — the first read-back this tool has ever had.
+        // video id in a playing state, on the stream that was already open when the
+        // command went out — the first read-back this tool has ever had.
         var observed = await ObserveAsync(
-            session,
+            subscription,
             state => string.Equals(state.VideoId, videoId, StringComparison.Ordinal)
                      && state.State is LoungePlayerState.Playing,
             ct).ConfigureAwait(false);
@@ -458,9 +468,13 @@ public sealed class TvControlService
     /// Consumes receiver state reports until one satisfies <paramref name="predicate"/>
     /// or the budget expires. Null means nothing matching was ever observed — which
     /// callers report as failure, never as an assumed success.
+    ///
+    /// Takes an ALREADY ESTABLISHED subscription rather than a session on purpose:
+    /// the type makes it impossible to reach observation without having opened the
+    /// stream first, so the command-before-subscribe ordering cannot come back.
     /// </summary>
     private async Task<LoungeReceiverState?> ObserveAsync(
-        ILoungeSession session,
+        ILoungeSubscription subscription,
         Func<LoungeReceiverState, bool> predicate,
         CancellationToken ct)
     {
@@ -469,7 +483,7 @@ public sealed class TvControlService
 
         try
         {
-            await foreach (var state in session.ObserveAsync(budget.Token).ConfigureAwait(false))
+            await foreach (var state in subscription.ReadAsync(budget.Token).ConfigureAwait(false))
             {
                 if (predicate(state))
                 {
@@ -581,9 +595,13 @@ public sealed class TvControlService
     {
         await using var session = await OpenReceiverAsync(ct).ConfigureAwait(false);
 
+        // Same ordering rule as every other observed path: the receiver answers
+        // getNowPlaying on the event stream, so the stream is open before it is asked.
+        await using var subscription = await session.SubscribeAsync(ct).ConfigureAwait(false);
+
         await session.SendAsync("getNowPlaying", null, ct).ConfigureAwait(false);
 
-        var state = await ObserveAsync(session, s => s.VideoId is { Length: > 0 }, ct).ConfigureAwait(false);
+        var state = await ObserveAsync(subscription, s => s.VideoId is { Length: > 0 }, ct).ConfigureAwait(false);
 
         return state is null
             ? new YouTubeControlResult(
@@ -606,10 +624,12 @@ public sealed class TvControlService
     {
         await using var session = await OpenReceiverAsync(ct).ConfigureAwait(false);
 
-        await session.SendAsync(command, parameters, ct).ConfigureAwait(false);
-
         if (observed is null)
         {
+            // Nothing to observe, so no stream is opened — this command is reported
+            // as accepted-not-observed either way.
+            await session.SendAsync(command, parameters, ct).ConfigureAwait(false);
+
             return new YouTubeControlResult(
                 command,
                 Observed: false,
@@ -617,7 +637,13 @@ public sealed class TvControlService
                         "so the effect was NOT observed and is not being reported as verified.");
         }
 
-        var state = await ObserveAsync(session, observed, ct).ConfigureAwait(false);
+        // Established before the command, for the reason spelled out in PlayYouTubeAsync:
+        // the confirming event is announced once and a stream opened afterwards can miss it.
+        await using var subscription = await session.SubscribeAsync(ct).ConfigureAwait(false);
+
+        await session.SendAsync(command, parameters, ct).ConfigureAwait(false);
+
+        var state = await ObserveAsync(subscription, observed, ct).ConfigureAwait(false);
 
         if (state is null)
         {
