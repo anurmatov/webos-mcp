@@ -123,6 +123,100 @@ public sealed class WebosMcpOptions
     public int ConnectTimeoutSeconds { get; set; } = 10;
 
     /// <summary>
+    /// Bound on the screenshot download, separate from
+    /// <see cref="RequestTimeoutSeconds"/> because it covers a different hop: the
+    /// SSAP call that produces the URI has already completed by then, and the
+    /// download runs outside the SSAP session so a slow fetch cannot hold the
+    /// control channel's gate.
+    ///
+    /// Read through <see cref="ResolvedScreenshotTimeoutSeconds"/>, never directly:
+    /// the raw value is operator input and an unchecked 0 or -1 would turn a bound
+    /// into its absence.
+    /// </summary>
+    public int ScreenshotTimeoutSeconds { get; set; } = DefaultScreenshotTimeoutSeconds;
+
+    /// <summary>
+    /// Hard cap on a captured frame. The download is streamed and aborted the
+    /// moment this is exceeded — the body is never buffered unbounded. A panel
+    /// frame is a few hundred kilobytes, so the default is deliberately generous
+    /// while still bounded.
+    ///
+    /// Read through <see cref="ResolvedScreenshotMaxBytes"/>, never directly.
+    /// </summary>
+    public int ScreenshotMaxBytes { get; set; } = DefaultScreenshotMaxBytes;
+
+    public const int DefaultScreenshotTimeoutSeconds = 15;
+    public const int DefaultScreenshotMaxBytes = 8 * 1024 * 1024;
+
+    /// <summary>Below this a capture could not complete on any real network.</summary>
+    public const int MinScreenshotTimeoutSeconds = 1;
+
+    /// <summary>Five minutes. Past this the "bounded timeout" guarantee is nominal.</summary>
+    public const int MaxScreenshotTimeoutSeconds = 300;
+
+    /// <summary>No real image is smaller than this, so a lower cap can only reject captures.</summary>
+    public const int MinScreenshotMaxBytes = 1024;
+
+    /// <summary>
+    /// 64 MiB. The whole body is held in memory while it is validated, so the
+    /// ceiling is what stops a hostile or broken responder turning the cap into an
+    /// out-of-memory condition.
+    /// </summary>
+    public const int MaxScreenshotMaxBytes = 64 * 1024 * 1024;
+
+    /// <summary>
+    /// The download timeout, range-checked. Follows <see cref="ResolvedDialPorts"/>:
+    /// an out-of-range value is an operator error and is reported as one rather
+    /// than clamped, because silently substituting a different bound than the one
+    /// configured is how a limit stops meaning what its owner thinks it means.
+    /// </summary>
+    public int ResolvedScreenshotTimeoutSeconds => RequireInRange(
+        ScreenshotTimeoutSeconds,
+        MinScreenshotTimeoutSeconds,
+        MaxScreenshotTimeoutSeconds,
+        "WEBOSMCP__SCREENSHOTTIMEOUTSECONDS",
+        "seconds");
+
+    /// <summary>The maximum capture size, range-checked. See above.</summary>
+    public int ResolvedScreenshotMaxBytes => RequireInRange(
+        ScreenshotMaxBytes,
+        MinScreenshotMaxBytes,
+        MaxScreenshotMaxBytes,
+        "WEBOSMCP__SCREENSHOTMAXBYTES",
+        "bytes");
+
+    /// <summary>
+    /// Touches every range-checked screenshot setting so a bad value fails the
+    /// server at startup rather than the first capture. Returns the first problem,
+    /// or null when the configuration is usable.
+    /// </summary>
+    public string? ValidateScreenshotLimits()
+    {
+        try
+        {
+            _ = ResolvedScreenshotTimeoutSeconds;
+            _ = ResolvedScreenshotMaxBytes;
+            return null;
+        }
+        catch (TvException ex)
+        {
+            return ex.Message;
+        }
+    }
+
+    private static int RequireInRange(int value, int min, int max, string key, string unit)
+    {
+        if (value < min || value > max)
+        {
+            throw TvException.Invalid(
+                $"{key} is {value} {unit}, which is outside the accepted range {min}-{max}. " +
+                "A zero, negative or unbounded value would remove the limit rather than configure it.");
+        }
+
+        return value;
+    }
+
+    /// <summary>
     /// How long to wait for an app launched over DIAL to actually reach the
     /// foreground. A launch that is accepted but never appears is a failure,
     /// not a slow success.

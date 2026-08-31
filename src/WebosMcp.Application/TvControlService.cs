@@ -71,6 +71,7 @@ public sealed class TvControlService
     private readonly IDelayProvider _delay;
     private readonly IDialClient _dial;
     private readonly ILoungeClient _lounge;
+    private readonly IScreenshotDownloader _downloader;
     private readonly WebosMcpOptions _options;
     private readonly ILogger<TvControlService> _logger;
 
@@ -79,6 +80,7 @@ public sealed class TvControlService
         IDelayProvider delay,
         IDialClient dial,
         ILoungeClient lounge,
+        IScreenshotDownloader downloader,
         IOptions<WebosMcpOptions> options,
         ILogger<TvControlService> logger)
     {
@@ -86,6 +88,7 @@ public sealed class TvControlService
         _delay = delay;
         _dial = dial;
         _lounge = lounge;
+        _downloader = downloader;
         _options = options.Value;
         _logger = logger;
     }
@@ -191,6 +194,45 @@ public sealed class TvControlService
 
             return apps;
         }, ct);
+
+    // ------------------------------------------------------------ screenshot
+
+    /// <summary>
+    /// Captures the current on-screen frame.
+    ///
+    /// Two hops, deliberately separated: the SSAP call announces a URI, and the
+    /// download fetches it. The download runs OUTSIDE the SSAP session — holding
+    /// the session gate across an HTTP fetch would block every other TV command
+    /// behind it and put the download under the SSAP timeout, which measures a
+    /// different thing.
+    ///
+    /// The frame lives in memory and nowhere else. Nothing here writes it, and
+    /// nothing logs more than its size and format.
+    /// </summary>
+    public async Task<CapturedScreenshot> CaptureScreenshotAsync(CancellationToken ct)
+    {
+        var announced = await _session.ExecuteAsync("take_screenshot", async (connection, token) =>
+        {
+            var payload = await connection
+                .RequestAsync(SsapUri.ExecuteOneShot, null, token)
+                .ConfigureAwait(false);
+
+            return JsonPayload.String(payload, "imageUri");
+        }, ct).ConfigureAwait(false);
+
+        var imageUri = ScreenshotPolicy.ValidateImageUri(announced, _options);
+        var bytes = await _downloader.DownloadAsync(imageUri, ct).ConfigureAwait(false);
+        var mimeType = ScreenshotPolicy.DetectImageMimeType(bytes.Span);
+
+        // Size and format only. The URI, the bytes and anything derived from the
+        // frame stay out of the log stream entirely.
+        _logger.LogInformation(
+            "Captured a screenshot: {MimeType}, {ByteCount} bytes, held in memory only.",
+            mimeType,
+            bytes.Length);
+
+        return new CapturedScreenshot(bytes, mimeType);
+    }
 
     // ----------------------------------------------------------------- audio
 
