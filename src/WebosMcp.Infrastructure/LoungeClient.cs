@@ -322,58 +322,138 @@ internal sealed class LoungeSession : ILoungeSession
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            string body;
+            var poll = await OpenPollAsync(lastEventId, cancellationToken).ConfigureAwait(false);
 
-            var url = BuildSessionUrl(new Dictionary<string, string>
-            {
-                ["RID"] = "rpc",
-                ["CI"] = "0",
-                ["TYPE"] = "xmlhttp",
-                ["AID"] = lastEventId.ToString(CultureInfo.InvariantCulture),
-            });
-
-            try
-            {
-                using var eventRequest = new HttpRequestMessage(HttpMethod.Get, url);
-                eventRequest.Headers.TryAddWithoutValidation("X-YouTube-LoungeId-Token", _loungeToken);
-
-                using var response = await _http
-                    .SendAsync(eventRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    _logger.LogWarning(
-                        "Lounge event stream returned HTTP {Status}; stopping observation.",
-                        (int)response.StatusCode);
-                    yield break;
-                }
-
-                body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
+            if (poll is null)
             {
                 yield break;
             }
 
-            var sawAny = false;
+            using var response = poll.Value.Response;
+            await using var stream = poll.Value.Stream;
 
-            foreach (var element in ParseChunks(body))
+            // Parsed INCREMENTALLY. This is a long poll: it stays open feeding events
+            // as they happen, so waiting for the response to end means waiting for the
+            // server to close it. That is why playback the receiver really did start
+            // was never observed inside the verification window — the video was
+            // playing and the report simply had not been read yet.
+            var chunks = new LoungeChunkStream();
+            var buffer = new byte[8192];
+            var readAny = false;
+
+            while (true)
             {
-                lastEventId = Math.Max(lastEventId, EventId(element) ?? lastEventId);
+                var read = await ReadAsync(stream, buffer, cancellationToken).ConfigureAwait(false);
 
-                if (ParseReceiverState(element) is { } state)
+                if (read <= 0)
                 {
-                    sawAny = true;
+                    break;
+                }
+
+                readAny = true;
+
+                foreach (var state in chunks.Append(buffer.AsSpan(0, read)))
+                {
                     yield return state;
                 }
             }
 
-            if (!sawAny && body.Length == 0)
+            lastEventId = Math.Max(lastEventId, chunks.LastEventId);
+
+            if (!readAny)
             {
+                // The channel closed with nothing at all; re-polling would spin.
                 yield break;
             }
         }
+    }
+
+    /// <summary>
+    /// Opens one long poll. Separated from the iterator because a catch block cannot
+    /// contain a yield, and swallowing the failure inline would hide it.
+    /// </summary>
+    private async Task<(HttpResponseMessage Response, Stream Stream)?> OpenPollAsync(
+        int lastEventId,
+        CancellationToken cancellationToken)
+    {
+        HttpResponseMessage? response = null;
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, BuildSubscriptionUrl(lastEventId));
+            request.Headers.TryAddWithoutValidation("X-YouTube-LoungeId-Token", _loungeToken);
+
+            response = await _http
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "Lounge event stream returned HTTP {Status}; stopping observation.",
+                    (int)response.StatusCode);
+
+                response.Dispose();
+                return null;
+            }
+
+            var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            return (response, stream);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
+        {
+            response?.Dispose();
+            return null;
+        }
+    }
+
+    /// <summary>Reads the next block, or -1 when the stream ends or faults.</summary>
+    private static async Task<int> ReadAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            return -1;
+        }
+    }
+
+    /// <summary>
+    /// The event-subscription query, as the reference client sends it. Deliberately
+    /// fuller than the command query: the subscription re-presents the remote's
+    /// identity, and the receiver would not feed a poll that omits it.
+    ///
+    /// The token is in the query here because that is the shape proven against
+    /// hardware; the log filtering that keeps request URIs out of the log stream is
+    /// what protects it. Do NOT reshape this to match the command query — they are
+    /// different requests and only the command one is proven in that shorter form.
+    /// </summary>
+    internal Uri BuildSubscriptionUrl(int lastEventId)
+    {
+        var query = new Dictionary<string, string>
+        {
+            ["name"] = _deviceName,
+            ["loungeIdToken"] = _loungeToken,
+            ["device"] = "REMOTE_CONTROL",
+            ["app"] = AppName,
+            ["VER"] = "8",
+            ["v"] = "2",
+            ["RID"] = "rpc",
+            ["SID"] = _sessionId ?? string.Empty,
+            ["gsessionid"] = _gSessionId ?? string.Empty,
+            ["CI"] = "0",
+            ["TYPE"] = "xmlhttp",
+            ["AID"] = lastEventId.ToString(CultureInfo.InvariantCulture),
+        };
+
+        var encoded = string.Join(
+            "&",
+            query.Where(kv => !string.IsNullOrEmpty(kv.Value))
+                .Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
+
+        return new Uri(_baseUrl, $"{BindPath}?{encoded}");
     }
 
     /// <summary>

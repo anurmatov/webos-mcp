@@ -222,8 +222,12 @@ public sealed class LoungeBindShapeTests
     }
 
     [Fact]
-    public async Task The_event_poll_query_matches_the_same_shape_plus_the_stream_fields()
+    public async Task The_event_subscription_query_matches_the_hardware_proven_shape()
     {
+        // The subscription re-presents the remote's identity; the receiver will not
+        // feed a poll that omits it. This is deliberately FULLER than the command
+        // query — the two are different requests and only the command one is proven
+        // in the shorter form.
         var (client, http) = Build();
         var session = await client.ConnectAsync(ScreenId, CancellationToken.None);
 
@@ -233,22 +237,36 @@ public sealed class LoungeBindShapeTests
             break;
         }
 
-        var poll = http.Requests[2];
-        var query = Query(poll.Url);
+        var query = Query(http.Requests[2].Url);
 
+        Assert.Equal("webos-mcp-test", query["name"]);
+        Assert.Equal(Token, query["loungeIdToken"]);
+        Assert.Equal("REMOTE_CONTROL", query["device"]);
         Assert.Equal("youtube-desktop", query["app"]);
+        Assert.Equal("8", query["VER"]);
+        Assert.Equal("2", query["v"]);
         Assert.Equal("rpc", query["RID"]);
         Assert.Equal("SID-1", query["SID"]);
+        Assert.Equal("GSESSION-1", query["gsessionid"]);
+        Assert.Equal("0", query["CI"]);
         Assert.Equal("xmlhttp", query["TYPE"]);
-        Assert.True(query.ContainsKey("AID"));
+        Assert.Equal("0", query["AID"]);
+    }
 
-        Assert.Equal(Token, poll.TokenHeader);
-        Assert.DoesNotContain(Token, poll.Url, StringComparison.Ordinal);
+    [Fact]
+    public async Task The_command_query_is_left_exactly_as_hardware_proved_it()
+    {
+        // Command delivery is physically proven: the requested video really started.
+        // Fixing the subscription must not disturb it, so this pins the command
+        // query against being "unified" with the fuller subscription shape.
+        var http = await ConnectedAsync();
+        var query = Query(http.Requests[2].Url);
 
-        foreach (var stray in new[] { "id", "mdx-version", "ui", "t" })
-        {
-            Assert.False(query.ContainsKey(stray), $"'{stray}' should not be in the event query");
-        }
+        Assert.Equal(
+            ["CVER", "RID", "SID", "VER", "app", "auth_failure_option", "gsessionid"],
+            query.Keys.Order().ToArray());
+        Assert.DoesNotContain(Token, http.Requests[2].Url, StringComparison.Ordinal);
+        Assert.Equal(Token, http.Requests[2].TokenHeader);
     }
 
     [Fact]

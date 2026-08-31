@@ -111,11 +111,13 @@ thing.
 
 > On stdio, stdout is the protocol channel. All logging goes to stderr.
 
-> The YouTube Lounge token is sent as a form field or an
-> `X-YouTube-LoungeId-Token` header and never appears in a URL, so request logging
-> cannot print it. All three entry points additionally raise the HTTP logging
-> categories to `Warning` as defence in depth. Warnings and errors still surface —
-> they carry no URI.
+> The YouTube Lounge token is sent as a form field on the bind and as an
+> `X-YouTube-LoungeId-Token` header on commands. The **event subscription also
+> carries it in the query**, because that is the request shape the receiver was
+> proven to accept — so a live credential does reach a request URI on that one
+> path. All three entry points therefore raise the HTTP logging categories to
+> `Warning`, which is what keeps request URIs out of the log stream. Warnings and
+> errors still surface; they carry no URI.
 
 ---
 
