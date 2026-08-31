@@ -73,7 +73,7 @@ public sealed class ErrorContractTests
     }
 
     [Fact]
-    public void All_four_contract_codes_have_distinct_wire_values()
+    public void The_contract_codes_have_distinct_wire_values()
     {
         var codes = new[]
         {
@@ -81,21 +81,96 @@ public sealed class ErrorContractTests
             TvErrorCode.TvOff,
             TvErrorCode.TvUnreachable,
             TvErrorCode.TvUnsupportedCapability,
+            TvErrorCode.TvPermissionDenied,
         }.Select(c => c.ToWireCode()).ToArray();
 
         Assert.Equal(codes.Length, codes.Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(["PAIRING_REQUIRED", "TV_OFF", "TV_UNREACHABLE", "TV_UNSUPPORTED_CAPABILITY"], codes);
+        Assert.Equal(
+            [
+                "PAIRING_REQUIRED",
+                "TV_OFF",
+                "TV_UNREACHABLE",
+                "TV_UNSUPPORTED_CAPABILITY",
+                "TV_PERMISSION_DENIED",
+            ],
+            codes);
     }
 
+    /// <summary>
+    /// A COMMAND frame. The session is registered and other commands work, so an
+    /// authorization refusal is about this capability — never about the key.
+    /// </summary>
     [Theory]
-    [InlineData("403 access denied", TvErrorCode.PairingRequired)]
-    [InlineData("Client is not registered", TvErrorCode.PairingRequired)]
+    [InlineData("401 insufficient permissions", TvErrorCode.TvPermissionDenied)]
+    [InlineData("403 access denied", TvErrorCode.TvPermissionDenied)]
+    [InlineData("Permission denied", TvErrorCode.TvPermissionDenied)]
+    [InlineData("unauthorized", TvErrorCode.TvPermissionDenied)]
     [InlineData("404 no such service or method", TvErrorCode.TvUnsupportedCapability)]
     [InlineData("This feature is not supported", TvErrorCode.TvUnsupportedCapability)]
     [InlineData("something else went wrong", TvErrorCode.TvError)]
-    public void Ssap_error_text_maps_to_the_right_contract_code(string detail, TvErrorCode expected)
+    public void Request_frame_errors_map_to_the_right_contract_code(string detail, TvErrorCode expected)
     {
-        Assert.Equal(expected, SsapWebSocketConnection.MapSsapError(detail).Code);
+        Assert.Equal(expected, SsapWebSocketConnection.MapRequestError(detail).Code);
+    }
+
+    /// <summary>
+    /// A REGISTRATION frame. Here the same wording really does mean the supplied
+    /// key was refused, and PAIRING_REQUIRED is correct.
+    /// </summary>
+    [Theory]
+    [InlineData("403 access denied", TvErrorCode.PairingRequired)]
+    [InlineData("Client is not registered", TvErrorCode.PairingRequired)]
+    [InlineData("registration failed", TvErrorCode.PairingRequired)]
+    [InlineData("401 insufficient permissions", TvErrorCode.PairingRequired)]
+    [InlineData("404 no such service or method", TvErrorCode.TvUnsupportedCapability)]
+    [InlineData("something else went wrong", TvErrorCode.TvError)]
+    public void Registration_frame_errors_map_to_the_right_contract_code(string detail, TvErrorCode expected)
+    {
+        Assert.Equal(expected, SsapWebSocketConnection.MapRegistrationError(detail).Code);
+    }
+
+    [Fact]
+    public void A_denied_command_is_never_reported_as_a_missing_key()
+    {
+        // The regression this whole split exists for. tv_close_app returned
+        // "No valid client key" immediately after another SSAP call succeeded on
+        // the same registered session — sending an operator to re-pair a pairing
+        // that was never broken.
+        foreach (var detail in new[]
+        {
+            "403 access denied",
+            "401 insufficient permissions",
+            "Permission denied for this app",
+        })
+        {
+            var mapped = SsapWebSocketConnection.MapRequestError(detail);
+
+            Assert.NotEqual(TvErrorCode.PairingRequired, mapped.Code);
+            Assert.Equal(TvErrorCode.TvPermissionDenied, mapped.Code);
+
+            // The TV's own wording survives: it is what distinguishes one denied
+            // capability from another.
+            Assert.Contains(detail, mapped.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("No valid client key", mapped.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void No_authorization_wording_still_falls_through_to_PAIRING_REQUIRED_on_a_command()
+    {
+        // Guards the half-fixed state the issue calls out as worse than the status
+        // quo: every authorization refusal on a command frame must be covered, not
+        // just the two that were observed.
+        string[] refusals =
+        [
+            "401", "403", "denied", "Access Denied", "insufficient permissions",
+            "Unauthorized", "forbidden",
+        ];
+
+        Assert.All(
+            refusals,
+            detail => Assert.Equal(
+                TvErrorCode.TvPermissionDenied, SsapWebSocketConnection.MapRequestError(detail).Code));
     }
 
     [Fact]

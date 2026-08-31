@@ -217,6 +217,19 @@ Pairing survives restarts. If the TV later rejects a stored key (a factory
 reset, for instance), every tool returns `PAIRING_REQUIRED` and you re-run
 `pair`.
 
+**The key is granted against a permission set.** The TV records which permissions
+were requested at pairing time, and a key keeps exactly those capabilities — a
+later version of this server asking for more does **not** widen an existing grant.
+The server notices when a stored key predates its current permission set and says
+so when a command is denied; it never re-pairs on its own. See
+[changing the permission set](#changing-the-permission-set-requires-an-explicit-re-pair).
+
+> **Upgrading from an earlier version:** the permission set now also requests
+> `READ_RUNNING_APPS`, which is the grant covering running-app reads such as
+> `tv_get_foreground_app`. Existing pairings keep their old grant, so that tool
+> may keep returning `TV_PERMISSION_DENIED` until you re-run `pair` and accept the
+> prompt once. Everything else keeps working in the meantime.
+
 ---
 
 ## Pairing over MCP (opt-in)
@@ -358,10 +371,40 @@ registered by default**. Every tool returns
 | Tool | Description |
 |---|---|
 | `tv_get_power_state` | Current power state: `Active`, `ScreenOff`, `Standby`, `Unreachable`, `Unknown`. |
-| `tv_get_device_info` | Model, firmware and product information. |
+| `tv_get_device_info` | Model, firmware and product information. **Partial-result safe** — see below. |
 | `tv_get_foreground_app` | The app currently in the foreground. |
 | `tv_list_apps` | Installed apps with their launch ids. |
-| `tv_get_status` | Combined snapshot: power, foreground app and volume state. |
+| `tv_get_status` | Combined snapshot: power, foreground app and volume state. **Partial-result safe** — see below. |
+
+#### Partial results, and where they stop
+
+`tv_get_status` and `tv_get_device_info` each make several reads. When the session
+is healthy and the TV refuses **one** of them, the others are still returned:
+
+```json
+{
+  "power": "Active",
+  "foregroundApp": null,
+  "volume": { "volume": 12, "muted": false },
+  "warnings": [
+    { "field": "foregroundApp", "code": "TV_PERMISSION_DENIED", "message": "..." }
+  ]
+}
+```
+
+A denied field is **present and null**, not omitted, so a caller can tell "the TV
+refused this" from "this tool does not return that". `warnings[].code` is always a
+typed wire code — `TV_PERMISSION_DENIED`, `TV_UNSUPPORTED_CAPABILITY` or
+`TV_ERROR` — never free text. When everything succeeds the `warnings` field is
+absent entirely, so an all-success response is byte-identical to what these tools
+returned before.
+
+**This applies only to command-level failures.** If a read fails at the
+connection or session level — `PAIRING_REQUIRED`, `TV_OFF`, `TV_UNREACHABLE`,
+`TIMEOUT` — the **whole call fails with that code** and the remaining reads are
+not attempted. A snapshot of nulls for a TV that is switched off would be a call
+reporting success when nothing was ever read, which is the more dangerous failure
+of the two.
 
 ### Power and display
 
@@ -527,9 +570,46 @@ machine-checkable code — you never have to string-match a message.
 | `TV_OFF` | Reachable but powered off or in standby. | Call `tv_power_on`. |
 | `TV_UNREACHABLE` | No route, no response, or the connection was lost. | Check the network and the configured host. |
 | `TV_UNSUPPORTED_CAPABILITY` | Connected, but this model or input does not support the action. | Nothing — the capability is absent. |
+| `TV_PERMISSION_DENIED` | The session is registered and healthy; the TV refused **this command** because the capability was not granted to this pairing. | Re-pair explicitly if the server's permission set has changed — see below. Otherwise the firmware does not grant it. |
 
 Plus `INVALID_INPUT` (rejected before any connection is opened), `TIMEOUT`
 and `TV_ERROR`.
+
+### `TV_PERMISSION_DENIED` is not `PAIRING_REQUIRED`
+
+These were once the same code, and conflating them was actively misleading: a
+denied `tv_close_app` reported "No valid client key" **immediately after another
+SSAP command had succeeded on the same registered session**, sending an operator
+to re-pair a pairing that was never broken.
+
+They are now separated by which frame failed:
+
+- On the **registration** frame, an authorization refusal really does mean the
+  supplied key was not accepted → `PAIRING_REQUIRED`.
+- On an ordinary **command** frame, the key is present, the session is live, and
+  the very next command may succeed. The refusal is about that one capability →
+  `TV_PERMISSION_DENIED`, carrying the TV's own wording, which is what
+  distinguishes one denied capability from another.
+
+### Changing the permission set requires an explicit re-pair
+
+The TV grants a key against the permission manifest presented at pairing time.
+Adding a permission later **does not widen an existing grant** — the key keeps the
+capabilities it was issued with until a human re-pairs.
+
+The server records which permission set a key was granted under (a short digest,
+not a secret) alongside the key. When a command is denied and the stored grant
+predates the current manifest, the error says so and names the explicit action.
+
+**Nothing re-pairs automatically, and nothing clears a working key.** Pairing needs
+a person at the TV, so a background re-pair would either fail or condition someone
+to approve prompts they did not ask for — and clearing a working key to force the
+issue would break every command the old grant still covers. To pick up added
+permissions, run `webos-mcp pair` (or call `pair_device` with `force=true` where it
+is enabled) and accept the prompt.
+
+A key stored by a version before this tracking existed has no recorded set, and is
+treated as predating the current one — which is exactly right, because it does.
 
 The opt-in pairing tool adds four more, each distinguishable:
 

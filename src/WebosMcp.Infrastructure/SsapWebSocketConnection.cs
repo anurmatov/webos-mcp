@@ -381,18 +381,23 @@ public sealed class SsapWebSocketConnection : ISsapConnection
 
             var type = root.TryGetProperty("type", out var typeElement) ? typeElement.GetString() : null;
 
+            // Which frame this is decides how an authorization refusal is read.
+            // The id prefix is the only thing that distinguishes them, and the
+            // register handshake already relies on it below.
+            var isRegistration = id.StartsWith("register", StringComparison.Ordinal);
+
             if (string.Equals(type, "error", StringComparison.Ordinal))
             {
                 var detail = root.TryGetProperty("error", out var error) ? error.GetString() : "unknown SSAP error";
-                completion.TrySetException(MapSsapError(detail));
+                completion.TrySetException(
+                    isRegistration ? MapRegistrationError(detail) : MapRequestError(detail));
                 return;
             }
 
             // The register handshake answers twice: an interim "response" while
             // the prompt is on screen, then "registered" with the key. Only the
             // second one completes the wait.
-            if (string.Equals(type, "response", StringComparison.Ordinal) &&
-                id.StartsWith("register", StringComparison.Ordinal))
+            if (string.Equals(type, "response", StringComparison.Ordinal) && isRegistration)
             {
                 return;
             }
@@ -408,7 +413,8 @@ public sealed class SsapWebSocketConnection : ISsapConnection
                 var detail = payload.TryGetProperty("errorText", out var errorText)
                     ? errorText.GetString()
                     : "the TV rejected the request";
-                completion.TrySetException(MapSsapError(detail));
+                completion.TrySetException(
+                    isRegistration ? MapRegistrationError(detail) : MapRequestError(detail));
                 return;
             }
 
@@ -416,18 +422,66 @@ public sealed class SsapWebSocketConnection : ISsapConnection
         }
     }
 
-    internal static TvException MapSsapError(string? detail)
+    /// <summary>
+    /// Maps a failure on the REGISTRATION frame.
+    ///
+    /// Here — and only here — an authorization refusal really does mean the
+    /// supplied key was not accepted, so it is <see cref="TvErrorCode.PairingRequired"/>.
+    /// </summary>
+    internal static TvException MapRegistrationError(string? detail)
     {
         var text = detail ?? "unknown SSAP error";
 
-        if (text.Contains("403", StringComparison.Ordinal) ||
-            text.Contains("denied", StringComparison.OrdinalIgnoreCase) ||
+        if (IsAuthorizationRefusal(text) ||
             text.Contains("registration", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("not registered", StringComparison.OrdinalIgnoreCase))
         {
             return TvException.PairingRequired();
         }
 
+        return MapCapabilityOrGeneric(text);
+    }
+
+    /// <summary>
+    /// Maps a failure on an ordinary COMMAND frame, on a session that is already
+    /// registered.
+    ///
+    /// The distinction from <see cref="MapRegistrationError"/> is the whole point.
+    /// A registered session can be refused a single command because that
+    /// capability was never granted to the pairing — the key is present, the
+    /// session is live, and the very next command may succeed. Reporting that as
+    /// PAIRING_REQUIRED is what produced "No valid client key" for tv_close_app
+    /// immediately after another SSAP call succeeded on the same connection: it
+    /// sends an operator to fix a pairing that was never broken, and buries the
+    /// real cause.
+    /// </summary>
+    internal static TvException MapRequestError(string? detail)
+    {
+        var text = detail ?? "unknown SSAP error";
+
+        if (IsAuthorizationRefusal(text))
+        {
+            return TvException.PermissionDenied(text);
+        }
+
+        return MapCapabilityOrGeneric(text);
+    }
+
+    /// <summary>
+    /// Wording webOS uses to refuse for authorization reasons. 401 is included
+    /// because current firmware answers "401 insufficient permissions" for a
+    /// capability the manifest did not obtain.
+    /// </summary>
+    private static bool IsAuthorizationRefusal(string text) =>
+        text.Contains("401", StringComparison.Ordinal) ||
+        text.Contains("403", StringComparison.Ordinal) ||
+        text.Contains("denied", StringComparison.OrdinalIgnoreCase) ||
+        text.Contains("insufficient permission", StringComparison.OrdinalIgnoreCase) ||
+        text.Contains("unauthorized", StringComparison.OrdinalIgnoreCase) ||
+        text.Contains("forbidden", StringComparison.OrdinalIgnoreCase);
+
+    private static TvException MapCapabilityOrGeneric(string text)
+    {
         if (text.Contains("404", StringComparison.Ordinal) ||
             text.Contains("no such service", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("not supported", StringComparison.OrdinalIgnoreCase) ||

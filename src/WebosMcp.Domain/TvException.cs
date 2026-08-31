@@ -28,6 +28,18 @@ public sealed class TvException : Exception
         TvErrorCode.TvUnsupportedCapability,
         $"This TV or the current input does not support '{capability}'.");
 
+    /// <summary>
+    /// The command was refused for lack of a granted capability, on a session
+    /// that is registered and working. Carries the TV's own wording because that
+    /// is what distinguishes one denied capability from another — and it must
+    /// never be flattened into "no valid client key".
+    /// </summary>
+    public static TvException PermissionDenied(string detail) => new(
+        TvErrorCode.TvPermissionDenied,
+        $"The TV refused this command for lack of a granted permission: {detail}. " +
+        "The pairing itself is intact — other commands still work — so re-pairing only helps if the " +
+        "server's permission manifest has changed since this TV was paired.");
+
     public static TvException Invalid(string detail) => new(TvErrorCode.InvalidInput, detail);
 
     public static TvException TimedOut(string operation) =>

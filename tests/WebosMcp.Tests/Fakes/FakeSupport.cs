@@ -24,6 +24,15 @@ public sealed class FakeClientKeyStore : IClientKeyStore
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Simulates a key granted under a permission set older than this build's.
+    /// Defaults to false so no existing test picks up the re-pair hint.
+    /// </summary>
+    public bool GrantIsStale { get; set; }
+
+    public Task<bool> IsGrantStaleAsync(CancellationToken cancellationToken) =>
+        Task.FromResult(GrantIsStale);
+
     /// <summary>Null simulates a read-only key source with no writable destination.</summary>
     public string? DurableWritablePath { get; set; } = "/test/clientkey.json";
 
