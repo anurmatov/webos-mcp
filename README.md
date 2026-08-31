@@ -236,6 +236,31 @@ operator-owned and read-only to the process, so pairing writes to
 secret, `CLIENTKEYPATH` **must** point at a writable volume or pairing fails
 with `KEY_STORAGE_READONLY` — deliberately *before* anyone is sent to the TV.
 
+### DIAL (YouTube playback)
+
+`tv_youtube_play` needs the TV's DIAL endpoint. It is resolved in four steps,
+stopping at the first that works:
+
+1. `WEBOSMCP__DIALAPPLICATIONURL`, if you set it — no discovery at all.
+2. A direct HTTP probe of `WEBOSMCP__HOST` on each `WEBOSMCP__DIALPORTS` port.
+3. A **unicast** SSDP `M-SEARCH` sent straight to the TV.
+4. A multicast SSDP `M-SEARCH`.
+
+Steps 1–3 need no multicast, which matters because a container on a bridge
+network normally cannot receive it. Step 4 is last for that reason.
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEBOSMCP__DIALPORTS` | `2038,1754,3000,8080,9080` | Ports probed directly on the TV. `2038` is first because that is the port LG webOS has been observed advertising DIAL on. |
+| `WEBOSMCP__DIALAPPLICATIONURL` | *(none)* | Skip discovery entirely, e.g. `http://192.0.2.10:2038/apps/`. The deterministic escape hatch when neither probing nor SSDP reaches the TV. |
+| `WEBOSMCP__DIALSSDPTIMEOUTSECONDS` | `3` | How long each SSDP search window stays open. |
+
+To find the right value for a stubborn TV, run `M-SEARCH` from a host on the
+same LAN and read the `LOCATION` header of the reply; that host and port are
+what to put in `WEBOSMCP__DIALAPPLICATIONURL` (or add the port to
+`WEBOSMCP__DIALPORTS`). Where no DIAL endpoint exists at all, `tv_youtube_play`
+reports `TV_UNSUPPORTED_CAPABILITY` rather than a false success.
+
 ### Timeouts
 
 | Variable | Default | Description |
@@ -502,6 +527,10 @@ Specifically **not** claimed:
 - That every TV exposes a DIAL endpoint. Where it does not, `tv_youtube_play`
   reports `TV_UNSUPPORTED_CAPABILITY` rather than falling back to something
   unverifiable.
+- That the built-in `WEBOSMCP__DIALPORTS` list covers every model. `2038` is
+  what LG webOS was observed using, not a value from a specification. If your
+  TV advertises DIAL somewhere else, set `WEBOSMCP__DIALAPPLICATIONURL` or add
+  the port — the unicast SSDP step is there to find it without you having to.
 - That text entry reaches every app. Apps with custom on-screen keyboards
   ignore standard SSAP text entry, and `tv_type_text` refuses for those rather
   than reporting a no-op as success.
@@ -534,6 +563,17 @@ The packet went out but the TV never came up. In order of likelihood: WOL is
 disabled on the TV; you are in bridge mode and neither WOL leg reached it (use
 `network_mode: host`); or `WEBOSMCP__BROADCASTADDRESS` is not your subnet's
 broadcast address. The response lists the targets actually written to.
+
+**`tv_youtube_play` returns `TV_UNSUPPORTED_CAPABILITY` ("no DIAL endpoint")
+but the TV does support YouTube.**
+The DIAL endpoint was not found. In a container this is almost always because
+SSDP multicast does not cross the bridge network — which is why the TV is also
+probed directly and searched by unicast. Check `WEBOSMCP__HOST` is set and
+correct, since every non-multicast strategy depends on it. Then run an SSDP
+`M-SEARCH` from a host on the same LAN, read the `LOCATION` header of the
+reply, and either add that port to `WEBOSMCP__DIALPORTS` or set
+`WEBOSMCP__DIALAPPLICATIONURL` to it directly. The server logs which ports it
+probed when resolution fails.
 
 **The server refuses to start with "Refusing to start".**
 You set a non-loopback `WEBOS_MCP_HTTP_BIND` without a token. Set

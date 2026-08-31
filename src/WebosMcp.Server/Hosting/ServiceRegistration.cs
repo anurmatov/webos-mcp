@@ -21,6 +21,7 @@ public static class ServiceRegistration
         services.AddSingleton<IWolSender, UdpWolSender>();
         services.AddSingleton<IClientKeyStore, FileClientKeyStore>();
         services.AddSingleton<ITvDiscovery, SsdpTvDiscovery>();
+        services.AddSingleton<ISsdpChannel, UdpSsdpChannel>();
 
         // DIAL is a third protocol alongside SSAP and WOL; it gets a plain
         // HttpClient with a short timeout, since every call is LAN-local.

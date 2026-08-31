@@ -30,6 +30,17 @@ services:
       # Set this to your subnet's broadcast address for the most reliable WOL.
       WEBOSMCP__BROADCASTADDRESS: "192.0.2.255"
 
+      # --- DIAL (YouTube playback) ---------------------------------------
+      # DIAL is normally advertised over SSDP multicast, which a container on a
+      # bridge network cannot receive. The TV is therefore probed directly on
+      # these ports first, and searched by unicast SSDP second — both of which
+      # need WEBOSMCP__HOST above to be correct. 2038 is the port LG webOS was
+      # observed using; leave the list alone unless your TV differs.
+      # WEBOSMCP__DIALPORTS: "2038,1754,3000,8080,9080"
+      #
+      # Last-resort override: skip discovery and use this endpoint verbatim.
+      # WEBOSMCP__DIALAPPLICATIONURL: "http://192.0.2.10:2038/apps/"
+
       # --- Pairing -------------------------------------------------------
       # Durable, WRITABLE location pairing persists to. Backed by the named
       # volume below so a paired key survives container replacement.

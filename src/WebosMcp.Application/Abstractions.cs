@@ -121,6 +121,25 @@ public interface ITvDiscovery
     Task<IReadOnlyList<DiscoveredTv>> DiscoverAsync(TimeSpan timeout, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Sends one SSDP M-SEARCH and collects the raw responses received before the
+/// window closes. Abstracted so DIAL resolution — including the unicast search
+/// that replaces multicast inside a container — is exercised in CI with no TV
+/// and no multicast-capable network.
+/// </summary>
+public interface ISsdpChannel
+{
+    /// <param name="target">
+    /// Where to send. A unicast TV address works on networks that drop multicast;
+    /// 239.255.255.250:1900 is the conventional multicast group.
+    /// </param>
+    Task<IReadOnlyList<string>> SearchAsync(
+        System.Net.IPEndPoint target,
+        string searchTarget,
+        TimeSpan window,
+        CancellationToken cancellationToken);
+}
+
 /// <summary>Abstracted so fallback-sequence pacing is instant and deterministic in tests.</summary>
 public interface IDelayProvider
 {

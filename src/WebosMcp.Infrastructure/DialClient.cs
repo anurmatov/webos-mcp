@@ -27,15 +27,21 @@ public sealed partial class DialClient : IDialClient, IDisposable
 
     private readonly HttpClient _http;
     private readonly WebosMcpOptions _options;
+    private readonly ISsdpChannel _ssdp;
     private readonly ILogger<DialClient> _logger;
 
     // The application URL rarely changes, and rediscovery costs an SSDP round.
     private Uri? _cachedApplicationUrl;
 
-    public DialClient(HttpClient http, IOptions<WebosMcpOptions> options, ILogger<DialClient> logger)
+    public DialClient(
+        HttpClient http,
+        IOptions<WebosMcpOptions> options,
+        ISsdpChannel ssdp,
+        ILogger<DialClient> logger)
     {
         _http = http;
         _options = options.Value;
+        _ssdp = ssdp;
         _logger = logger;
     }
 
@@ -49,26 +55,95 @@ public sealed partial class DialClient : IDialClient, IDisposable
             return _cachedApplicationUrl;
         }
 
-        // Preferred: ask the configured TV directly. SSDP multicast is dropped
-        // by plenty of networks, and we already know the address.
+        // 1. An explicitly configured URL is authoritative — no discovery at all.
+        var configured = _options.ResolvedDialApplicationUrl;
+        if (configured is not null)
+        {
+            _logger.LogInformation("Using the configured DIAL application URL.");
+            _cachedApplicationUrl = configured;
+            return configured;
+        }
+
+        // 2. Probe the known host directly. This is the path that has to work in a
+        //    container, where SSDP multicast does not leave the bridge network. The
+        //    ports run concurrently so an absent DIAL endpoint costs one timeout,
+        //    not one per port; the winner is still chosen in configured order so
+        //    the result does not depend on which probe happened to return first.
         if (!string.IsNullOrWhiteSpace(_options.Host))
         {
-            foreach (var port in new[] { 1754, 3000, 8080, 9080 })
-            {
-                var candidate = await ProbeDeviceDescriptionAsync(
-                    new Uri($"http://{_options.Host}:{port}/"), cancellationToken).ConfigureAwait(false);
+            var ports = _options.ResolvedDialPorts;
 
-                if (candidate is not null)
+            var probes = ports
+                .Select(port => ProbeDeviceDescriptionAsync(
+                    new Uri($"http://{_options.Host}:{port}/"), cancellationToken))
+                .ToArray();
+
+            var results = await Task.WhenAll(probes).ConfigureAwait(false);
+
+            for (var i = 0; i < results.Length; i++)
+            {
+                if (results[i] is { } hit)
                 {
-                    _cachedApplicationUrl = candidate;
-                    return candidate;
+                    _logger.LogInformation("Resolved DIAL on {Host}:{Port} by direct probe.", _options.Host, ports[i]);
+                    _cachedApplicationUrl = hit;
+                    return hit;
                 }
             }
         }
 
-        var located = await DiscoverViaSsdpAsync(cancellationToken).ConfigureAwait(false);
-        _cachedApplicationUrl = located;
-        return located;
+        // 3. Unicast M-SEARCH straight at the TV. This needs no multicast route and
+        //    returns the TV's own LOCATION, so it finds endpoints on ports or paths
+        //    the direct probes above do not know about.
+        var viaUnicast = await SearchAsync(UnicastSsdpTarget(), cancellationToken).ConfigureAwait(false);
+        if (viaUnicast is not null)
+        {
+            _cachedApplicationUrl = viaUnicast;
+            return viaUnicast;
+        }
+
+        // 4. Multicast, last. It is the one strategy a container usually cannot use.
+        var viaMulticast = await SearchAsync(
+            new IPEndPoint(IPAddress.Parse(SsdpAddress), SsdpPort), cancellationToken).ConfigureAwait(false);
+
+        if (viaMulticast is null)
+        {
+            _logger.LogInformation(
+                "No DIAL endpoint found: probed {Host} on ports {Ports}, then unicast and multicast SSDP.",
+                _options.Host, _options.DialPorts);
+        }
+
+        _cachedApplicationUrl = viaMulticast;
+        return viaMulticast;
+    }
+
+    /// <summary>
+    /// The configured TV's SSDP port, or null when no usable host is configured.
+    /// Resolution failures are not fatal here — this is one strategy of several.
+    /// </summary>
+    private IPEndPoint? UnicastSsdpTarget()
+    {
+        if (string.IsNullOrWhiteSpace(_options.Host))
+        {
+            return null;
+        }
+
+        if (IPAddress.TryParse(_options.Host, out var parsed))
+        {
+            return new IPEndPoint(parsed, SsdpPort);
+        }
+
+        try
+        {
+            var v4 = Array.Find(
+                Dns.GetHostAddresses(_options.Host!),
+                a => a.AddressFamily == AddressFamily.InterNetwork);
+
+            return v4 is null ? null : new IPEndPoint(v4, SsdpPort);
+        }
+        catch (Exception ex) when (ex is SocketException or ArgumentException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -110,55 +185,39 @@ public sealed partial class DialClient : IDialClient, IDisposable
         }
     }
 
-    private async Task<Uri?> DiscoverViaSsdpAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Runs one M-SEARCH and probes every LOCATION it advertises. Returns the first
+    /// address that answers as a real DIAL endpoint, or null.
+    /// </summary>
+    private async Task<Uri?> SearchAsync(IPEndPoint? target, CancellationToken cancellationToken)
     {
-        var request =
-            "M-SEARCH * HTTP/1.1\r\n" +
-            $"HOST: {SsdpAddress}:{SsdpPort}\r\n" +
-            "MAN: \"ssdp:discover\"\r\n" +
-            "MX: 2\r\n" +
-            $"ST: {DialSearchTarget}\r\n\r\n";
-
-        using var client = new UdpClient(AddressFamily.InterNetwork);
-        client.EnableBroadcast = true;
-        client.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
-
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        deadline.CancelAfter(TimeSpan.FromSeconds(4));
-
-        try
+        if (target is null)
         {
-            await client.SendAsync(
-                Encoding.ASCII.GetBytes(request),
-                new IPEndPoint(IPAddress.Parse(SsdpAddress), SsdpPort),
-                deadline.Token).ConfigureAwait(false);
+            return null;
+        }
 
-            while (!deadline.IsCancellationRequested)
+        var window = TimeSpan.FromSeconds(Math.Max(1, _options.DialSsdpTimeoutSeconds));
+
+        var responses = await _ssdp
+            .SearchAsync(target, DialSearchTarget, window, cancellationToken)
+            .ConfigureAwait(false);
+
+        foreach (var response in responses)
+        {
+            if (!ParseHeaders(response).TryGetValue("LOCATION", out var location) ||
+                !Uri.TryCreate(location, UriKind.Absolute, out var uri))
             {
-                var result = await client.ReceiveAsync(deadline.Token).ConfigureAwait(false);
-                var headers = ParseHeaders(Encoding.ASCII.GetString(result.Buffer));
+                continue;
+            }
 
-                if (headers.TryGetValue("LOCATION", out var location) &&
-                    Uri.TryCreate(location, UriKind.Absolute, out var uri))
-                {
-                    var appsUrl = await ProbeDeviceDescriptionAsync(uri, deadline.Token).ConfigureAwait(false);
-                    if (appsUrl is not null)
-                    {
-                        return appsUrl;
-                    }
-                }
+            var appsUrl = await ProbeDeviceDescriptionAsync(uri, cancellationToken).ConfigureAwait(false);
+            if (appsUrl is not null)
+            {
+                _logger.LogInformation("Resolved DIAL via SSDP search to {Target}.", target);
+                return appsUrl;
             }
         }
-        catch (OperationCanceledException)
-        {
-            // Search window closed without a DIAL responder.
-        }
-        catch (SocketException ex)
-        {
-            _logger.LogWarning("DIAL SSDP discovery failed: {Message}", ex.Message);
-        }
 
-        _logger.LogInformation("No DIAL endpoint found on the local segment.");
         return null;
     }
 

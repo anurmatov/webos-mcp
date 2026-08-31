@@ -26,6 +26,25 @@ public sealed class WebosMcpOptions
     /// <summary>Broadcast address used for the WOL magic packet. Defaults to the all-subnets broadcast.</summary>
     public string BroadcastAddress { get; set; } = "255.255.255.255";
 
+    /// <summary>
+    /// Explicit DIAL application URL, e.g. http://192.0.2.10:2038/apps/. When set,
+    /// DIAL resolution uses it directly and performs no discovery at all — the
+    /// deterministic escape hatch for networks where neither the direct port
+    /// probes nor SSDP reach the TV.
+    /// </summary>
+    public string? DialApplicationUrl { get; set; }
+
+    /// <summary>
+    /// Comma-separated ports probed directly on <see cref="Host"/> when looking for
+    /// the TV's DIAL device description. 2038 is first because that is the port LG
+    /// webOS was observed advertising; a container cannot rely on SSDP multicast to
+    /// find it, so the known host is probed directly before any discovery is tried.
+    /// </summary>
+    public string DialPorts { get; set; } = "2038,1754,3000,8080,9080";
+
+    /// <summary>How long a single SSDP M-SEARCH window stays open.</summary>
+    public int DialSsdpTimeoutSeconds { get; set; } = 3;
+
     /// <summary>Pre-paired client key supplied inline (environment variable).</summary>
     public string? ClientKey { get; set; }
 
@@ -73,6 +92,61 @@ public sealed class WebosMcpOptions
 
     /// <summary>Delay between steps of a bounded remote-control fallback sequence.</summary>
     public int FallbackStepDelayMilliseconds { get; set; } = 400;
+
+    /// <summary>
+    /// <see cref="DialPorts"/> parsed, de-duplicated and order-preserving. Invalid or
+    /// out-of-range entries are rejected loudly rather than silently skipped: a typo
+    /// that quietly drops the one port the TV answers on is exactly the failure this
+    /// setting exists to prevent.
+    /// </summary>
+    public IReadOnlyList<int> ResolvedDialPorts
+    {
+        get
+        {
+            var ports = new List<int>();
+
+            foreach (var part in (DialPorts ?? string.Empty).Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (!int.TryParse(part, out var port) || port < 1 || port > 65535)
+                {
+                    throw TvException.Invalid(
+                        $"'{part}' in WEBOSMCP__DIALPORTS is not a valid TCP port. Expected a comma-separated list, for example 2038,1754,3000.");
+                }
+
+                if (!ports.Contains(port))
+                {
+                    ports.Add(port);
+                }
+            }
+
+            return ports;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="DialApplicationUrl"/> validated, or null when unset. A malformed
+    /// value is an operator error and is reported as one — never degraded into
+    /// "this TV has no DIAL endpoint", which would blame the TV for a typo.
+    /// </summary>
+    public Uri? ResolvedDialApplicationUrl
+    {
+        get
+        {
+            if (string.IsNullOrWhiteSpace(DialApplicationUrl))
+            {
+                return null;
+            }
+
+            if (!Uri.TryCreate(DialApplicationUrl.Trim(), UriKind.Absolute, out var uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            {
+                throw TvException.Invalid(
+                    $"WEBOSMCP__DIALAPPLICATIONURL ('{DialApplicationUrl}') is not an absolute http(s) URL, for example http://192.0.2.10:2038/apps/.");
+            }
+
+            return uri;
+        }
+    }
 
     public string ResolvedClientKeyPath =>
         string.IsNullOrWhiteSpace(ClientKeyPath)
