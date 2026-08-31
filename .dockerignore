@@ -1,0 +1,23 @@
+# Build output. Copying host bin/obj into the image poisons the container
+# restore with paths that only exist on the host.
+**/bin/
+**/obj/
+artifacts/
+TestResults/
+
+# Local operator state and secrets — must never reach an image layer.
+secrets/
+.webos-mcp/
+clientkey.json
+*.clientkey.json
+.env
+
+.git/
+.github/
+.vs/
+.idea/
+*.user
+docker-compose.yml
+docker-compose.example.yml
+Dockerfile
+.dockerignore

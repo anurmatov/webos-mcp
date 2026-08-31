@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/WebosMcp.Application/WebosMcp.Application.csproj" />
+    <Project Path="src/WebosMcp.Domain/WebosMcp.Domain.csproj" />
+    <Project Path="src/WebosMcp.Infrastructure/WebosMcp.Infrastructure.csproj" />
+    <Project Path="src/WebosMcp.Server/WebosMcp.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/WebosMcp.Tests/WebosMcp.Tests.csproj" />
+  </Folder>
+</Solution>
