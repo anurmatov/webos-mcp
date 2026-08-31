@@ -332,8 +332,14 @@ reports `TV_UNSUPPORTED_CAPABILITY` rather than a false success.
 | `WEBOSMCP__POWERONVERIFYTIMEOUTSECONDS` | `60` | How long `tv_power_on` polls for an Active state. |
 | `WEBOSMCP__POWERONPOLLINTERVALSECONDS` | `3` | Interval between those polls. |
 | `WEBOSMCP__FALLBACKSTEPDELAYMILLISECONDS` | `400` | Pacing between steps of a bounded fallback sequence. |
-| `WEBOSMCP__SCREENSHOTTIMEOUTSECONDS` | `15` | Bound on the screenshot download. Separate from the SSAP timeout: the download runs outside the SSAP session, so a slow fetch cannot hold the control channel. |
-| `WEBOSMCP__SCREENSHOTMAXBYTES` | `8388608` | Maximum captured frame. Enforced while streaming — an oversized body is aborted, never buffered. |
+| `WEBOSMCP__SCREENSHOTTIMEOUTSECONDS` | `15` | Bound on the screenshot download, **1–300**. Separate from the SSAP timeout: the download runs outside the SSAP session, so a slow fetch cannot hold the control channel. |
+| `WEBOSMCP__SCREENSHOTMAXBYTES` | `8388608` | Maximum captured frame, **1024–67108864** (1 KiB – 64 MiB). Enforced while streaming — an oversized body is aborted, never buffered. |
+
+Both screenshot limits are **range-checked at startup, and the server refuses to
+start** with a value outside its range, naming the setting and the accepted range.
+They are not clamped: a `0` or `-1` would remove the bound rather than configure
+it, and silently substituting a different limit than the one written down is how a
+limit stops meaning what its owner thinks it means.
 
 ### HTTP transport
 
@@ -403,16 +409,26 @@ How the frame is handled, and why each rule is there:
   device store, a temp file, a cache, a log line or any telemetry. Nothing is
   logged about a capture beyond its size and detected format.
 - **The announced URI is untrusted.** The TV answers with an `imageUri` that the
-  server then fetches, which makes the TV an input rather than an authority. Only
-  `http` and `https` are accepted, userinfo is rejected, and **every** hop — the
-  first request and each redirect — must stay on the currently selected TV's host.
-  A cross-host `imageUri` or redirect is `INVALID_INPUT`, refused *before* the
-  request goes out rather than after.
+  server then fetches, which makes the TV an input rather than an authority. The
+  **full** rule set — `http`/`https` only, no userinfo, length capped, host pinned
+  to the selected TV — is applied to that URI *and independently to every redirect
+  target*. A redirect is simply a second URI from the same untrusted source, so
+  checking only the host on later hops would leave a `file://` target or embedded
+  credentials reachable one redirect away from a URI that passed every check. Any
+  violation is `INVALID_INPUT`, refused *before* the request goes out.
 - **Bounded.** Its own timeout and a streamed maximum body size, both
-  configurable; an oversized body is aborted mid-read rather than buffered.
-- **Validated as a real image by its bytes**, not by the `Content-Type` header. An
-  empty, oversized, HTML or otherwise non-image body is `TV_ERROR` and never a
-  reported success — a header saying `image/jpeg` is not evidence.
+  range-checked at startup; an oversized body is aborted mid-read, never buffered.
+- **Validated as a complete image by its bytes**, not by the `Content-Type` header
+  and not by a leading magic number. A JPEG must carry its EOI marker and a PNG its
+  terminal IEND chunk, because a download cut short keeps its signature and loses
+  its tail — so a prefix check would report a truncated, unopenable body as a
+  successful capture. Empty, truncated, oversized, HTML or otherwise non-image
+  bodies are all `TV_ERROR`.
+- **JPEG and PNG only.** WebP is deliberately not supported: a RIFF length field
+  can be made self-consistent over arbitrary content, so it cannot be validated to
+  the standard the other two are held to, and the verified capture returns JPEG. A
+  TV answering with WebP gets an honest `TV_ERROR` rather than a capture checked to
+  a lower bar.
 - **TLS validation is never globally disabled.** A self-signed certificate is
   tolerated only for the selected TV's own host, on this download's own HTTP
   handler, and nowhere else in the process.

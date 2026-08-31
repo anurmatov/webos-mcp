@@ -33,18 +33,21 @@ public sealed class ScreenshotDownloader : IScreenshotDownloader
 
     public async Task<ReadOnlyMemory<byte>> DownloadAsync(Uri imageUri, CancellationToken cancellationToken)
     {
-        var maxBytes = _options.ScreenshotMaxBytes;
+        // Resolved, not raw: an unvalidated 0 or -1 here would mean "no timeout"
+        // and "no size cap" rather than a configured bound.
+        var maxBytes = _options.ResolvedScreenshotMaxBytes;
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(_options.ScreenshotTimeoutSeconds));
+        timeout.CancelAfter(TimeSpan.FromSeconds(_options.ResolvedScreenshotTimeoutSeconds));
 
         var target = imageUri;
 
         for (var hop = 0; ; hop++)
         {
-            // Re-checked on entry, not only at the call site: this loop is the one
-            // place that decides what URL is actually requested.
-            ScreenshotPolicy.RequireSelectedTvHost(target, _options);
+            // The FULL policy on entry, not only the host: this loop is the one
+            // place that decides what URL is actually requested, and a redirect
+            // target is another URI from the same untrusted source.
+            ScreenshotPolicy.ValidateTarget(target, _options, "The capture download target");
 
             using var request = new HttpRequestMessage(HttpMethod.Get, target);
             using var response = await SendAsync(request, timeout.Token, cancellationToken).ConfigureAwait(false);
@@ -63,11 +66,11 @@ public sealed class ScreenshotDownloader : IScreenshotDownloader
                         TvErrorCode.TvError,
                         $"The TV answered the capture download with HTTP {(int)response.StatusCode} and no Location header.");
 
-                // A relative Location resolves against the current target, which is
-                // already pinned; an absolute one can point anywhere, so the result
-                // is re-pinned before it is used.
+                // A relative Location resolves against the current target; an
+                // absolute one can be anything at all — scheme, credentials and host
+                // included — so the resolved value goes through the same full policy
+                // as the original imageUri, at the top of the next iteration.
                 target = location.IsAbsoluteUri ? location : new Uri(target, location);
-                ScreenshotPolicy.RequireSelectedTvHost(target, _options);
                 continue;
             }
 

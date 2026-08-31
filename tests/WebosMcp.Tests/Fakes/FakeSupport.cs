@@ -62,21 +62,15 @@ public sealed class FakeWolSender : IWolSender
 }
 
 /// <summary>
-/// Stands in for the capture download. Defaults to a minimal but genuinely
-/// well-formed JPEG so no test can reach the network, and so a test that forgets
-/// to script a body still exercises a realistic success path.
+/// Stands in for the capture download. Defaults to a REAL, decode-verified JPEG
+/// (see <see cref="ImageFixtures"/>) so no test can reach the network, and so the
+/// default success path proves a usable image rather than a magic-number prefix.
 /// </summary>
 public sealed class FakeScreenshotDownloader : IScreenshotDownloader
 {
-    /// <summary>A three-byte JPEG signature: enough for content sniffing, and not a real image.</summary>
-    public static readonly byte[] SyntheticJpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46];
-
-    public static readonly byte[] SyntheticPng =
-        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D];
-
     public List<Uri> Requested { get; } = [];
 
-    public byte[] Body { get; set; } = SyntheticJpeg;
+    public byte[] Body { get; set; } = ImageFixtures.Jpeg;
 
     /// <summary>Thrown instead of returning a body, when set.</summary>
     public Exception? Failure { get; set; }

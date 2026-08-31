@@ -490,7 +490,7 @@ public sealed class TransportTests
 
         // Decoded by the CLIENT, from the wire. This is what fails if the block is
         // built with raw bytes in Data instead of base64 text.
-        Assert.Equal(FakeScreenshotDownloader.SyntheticJpeg, block.DecodedData.ToArray());
+        Assert.Equal(ImageFixtures.Jpeg, block.DecodedData.ToArray());
 
         // No text or base64-string content block alongside it.
         Assert.Empty(result.Content.OfType<TextContentBlock>());

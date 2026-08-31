@@ -30,9 +30,28 @@ public static class ScreenshotPolicy
 
     public const string Jpeg = "image/jpeg";
     public const string Png = "image/png";
-    public const string WebP = "image/webp";
 
     private static readonly byte[] PngSignature = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    /// <summary>The complete terminal PNG chunk: zero-length payload, "IEND", and its fixed CRC.</summary>
+    private static readonly byte[] PngIend =
+        [0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82];
+
+    /// <summary>
+    /// Smallest plausible complete file per format. A baseline JPEG carries full
+    /// quantisation and Huffman tables whatever the image size, so even a 2x2 is
+    /// several hundred bytes; a PNG needs signature, IHDR, an IDAT and IEND.
+    /// </summary>
+    private const int MinJpegBytes = 128;
+
+    private const int MinPngBytes = 57;
+
+    /// <summary>
+    /// Trailing NUL bytes tolerated after a JPEG's EOI marker. Some transports pad
+    /// to a block boundary; a bounded allowance accepts that without letting an
+    /// arbitrary tail stand in for a missing terminator.
+    /// </summary>
+    private const int MaxTrailingPadding = 16;
 
     /// <summary>
     /// Validates the URI the TV announced. Every rejection here is
@@ -59,6 +78,28 @@ public static class ScreenshotPolicy
             throw TvException.Invalid("The TV's imageUri is not a well-formed absolute URL.");
         }
 
+        ValidateTarget(uri, options, "The TV's imageUri");
+
+        return uri;
+    }
+
+    /// <summary>
+    /// The complete rule set for anything this download will actually request.
+    ///
+    /// Applied to the announced <c>imageUri</c> AND to every redirect target. That
+    /// symmetry is the point: a redirect is just a second URI supplied by the same
+    /// untrusted source, so checking only the host on later hops would leave a
+    /// <c>file://</c> target or embedded credentials reachable one redirect away
+    /// from a URI that passed every check.
+    /// </summary>
+    public static void ValidateTarget(Uri uri, WebosMcpOptions options, string what)
+    {
+        if (uri.AbsoluteUri.Length > InputValidation.MaxUrlLength)
+        {
+            throw TvException.Invalid(
+                $"{what} exceeds the maximum length of {InputValidation.MaxUrlLength} characters.");
+        }
+
         // Deliberately NOT InputValidation.ValidateHttpsUrl: that is HTTPS-only by
         // design for tv_open_url, where the target is an arbitrary external site.
         // This target is the TV itself on the local network, which commonly serves
@@ -68,37 +109,25 @@ public static class ScreenshotPolicy
             !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
         {
             throw TvException.Invalid(
-                $"The TV's imageUri uses the '{uri.Scheme}' scheme; only http and https are accepted.");
+                $"{what} uses the '{uri.Scheme}' scheme; only http and https are accepted.");
         }
 
         if (!string.IsNullOrEmpty(uri.UserInfo))
         {
-            throw TvException.Invalid("The TV's imageUri carries userinfo credentials, which are not accepted.");
+            throw TvException.Invalid($"{what} carries userinfo credentials, which are not accepted.");
         }
 
         if (string.IsNullOrWhiteSpace(uri.Host))
         {
-            throw TvException.Invalid("The TV's imageUri has no host component.");
+            throw TvException.Invalid($"{what} has no host component.");
         }
 
-        RequireSelectedTvHost(uri, options);
-
-        return uri;
-    }
-
-    /// <summary>
-    /// Pins a request target to the selected TV. Called for the first request AND
-    /// for every redirect hop — a redirect that leaves the TV is the same class of
-    /// failure as an imageUri that never pointed at it, and is reported as such.
-    /// </summary>
-    public static void RequireSelectedTvHost(Uri uri, WebosMcpOptions options)
-    {
         if (!IsSelectedTvHost(uri, options))
         {
             // The host itself is not echoed: it is TV-supplied and this message
             // reaches a caller. Naming the rule is enough to act on.
             throw TvException.Invalid(
-                "The capture download would leave the selected TV's host, which is refused. " +
+                $"{what} would leave the selected TV's host, which is refused. " +
                 "Only the TV that produced the capture may serve it.");
         }
     }
@@ -150,11 +179,23 @@ public static class ScreenshotPolicy
     }
 
     /// <summary>
-    /// Identifies the payload by its bytes. The <c>Content-Type</c> header is NOT
-    /// consulted: a TV — or anything answering in its place — can label an HTML
-    /// error page <c>image/jpeg</c>, and reporting that as a successful capture
-    /// would be exactly the kind of unverified success this project refuses
-    /// everywhere else.
+    /// Identifies the payload by its bytes, and requires the file to be COMPLETE.
+    ///
+    /// The <c>Content-Type</c> header is not consulted: a TV — or anything
+    /// answering in its place — can label an HTML error page <c>image/jpeg</c>.
+    ///
+    /// Nor is a leading magic number sufficient. A download cut short by a reset
+    /// connection keeps its signature and loses its tail, so a prefix check calls a
+    /// truncated, undecodable body a successful capture — the same unverified
+    /// success this project refuses everywhere else, arriving through the one door
+    /// a header check does not cover. Each format is therefore accepted only with
+    /// its terminator present: a JPEG's EOI marker, a PNG's IEND chunk.
+    ///
+    /// WebP is deliberately NOT supported. A RIFF length field can be made
+    /// self-consistent over arbitrary content, so the check available for it is
+    /// materially weaker than the other two, and the verified probe returned JPEG.
+    /// A TV that answers with WebP gets an honest TV_ERROR naming the supported
+    /// formats rather than a capture validated to a lower standard.
     /// </summary>
     public static string DetectImageMimeType(ReadOnlySpan<byte> bytes)
     {
@@ -167,25 +208,47 @@ public static class ScreenshotPolicy
 
         if (bytes.Length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
         {
+            if (bytes.Length < MinJpegBytes || !EndsWithJpegEoi(bytes))
+            {
+                throw Incomplete("JPEG", "its EOI (FF D9) end-of-image marker", bytes.Length);
+            }
+
             return Jpeg;
         }
 
         if (bytes.Length >= PngSignature.Length && bytes[..PngSignature.Length].SequenceEqual(PngSignature))
         {
-            return Png;
-        }
+            if (bytes.Length < MinPngBytes || !bytes[^PngIend.Length..].SequenceEqual(PngIend))
+            {
+                throw Incomplete("PNG", "its terminal IEND chunk", bytes.Length);
+            }
 
-        if (bytes.Length >= 12 &&
-            bytes[..4].SequenceEqual("RIFF"u8) &&
-            bytes[8..12].SequenceEqual("WEBP"u8))
-        {
-            return WebP;
+            return Png;
         }
 
         throw new TvException(
             TvErrorCode.TvError,
             $"The capture download returned {bytes.Length} bytes that are not a supported image. " +
-            "Expected JPEG, PNG or WebP, identified by content rather than by the declared Content-Type.");
+            "Expected a complete JPEG or PNG, identified by content rather than by the declared Content-Type.");
+    }
+
+    private static TvException Incomplete(string format, string terminator, int length) => new(
+        TvErrorCode.TvError,
+        $"The capture download returned {length} bytes that begin as a {format} but are missing " +
+        $"{terminator}. The download was truncated, so the image is incomplete and is not reported " +
+        "as a successful capture.");
+
+    private static bool EndsWithJpegEoi(ReadOnlySpan<byte> bytes)
+    {
+        var end = bytes.Length;
+        var floor = Math.Max(2, end - MaxTrailingPadding);
+
+        while (end > floor && bytes[end - 1] == 0x00)
+        {
+            end--;
+        }
+
+        return end >= 2 && bytes[end - 2] == 0xFF && bytes[end - 1] == 0xD9;
     }
 
     private static bool HostsMatch(string candidate, string other)

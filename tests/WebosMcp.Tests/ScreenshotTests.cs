@@ -5,6 +5,7 @@ using ModelContextProtocol.Protocol;
 using WebosMcp.Application;
 using WebosMcp.Domain;
 using WebosMcp.Infrastructure;
+using WebosMcp.Server.Hosting;
 using WebosMcp.Server.Tools;
 using WebosMcp.Tests.Fakes;
 using Xunit;
@@ -70,7 +71,7 @@ public sealed class ScreenshotTests
         var shot = await harness.Control.CaptureScreenshotAsync(CancellationToken.None);
 
         Assert.Equal("image/jpeg", shot.MimeType);
-        Assert.Equal(FakeScreenshotDownloader.SyntheticJpeg, shot.Bytes.ToArray());
+        Assert.Equal(ImageFixtures.Jpeg, shot.Bytes.ToArray());
         Assert.Equal(new Uri(CaptureUri), Assert.Single(harness.Downloader.Requested));
     }
 
@@ -80,7 +81,7 @@ public sealed class ScreenshotTests
         // The URI says .jpg; the bytes say PNG. The bytes win — the alternative is
         // trusting a label the TV supplies about a body it also supplies.
         var harness = HarnessAnnouncing(CaptureUri);
-        harness.Downloader.Body = FakeScreenshotDownloader.SyntheticPng;
+        harness.Downloader.Body = ImageFixtures.Png;
 
         var shot = await harness.Control.CaptureScreenshotAsync(CancellationToken.None);
 
@@ -230,23 +231,92 @@ public sealed class ScreenshotTests
     }
 
     [Fact]
-    public void Content_sniffing_recognises_exactly_the_three_supported_formats()
+    public void Content_sniffing_recognises_exactly_the_two_supported_formats()
     {
-        Assert.Equal("image/jpeg", ScreenshotPolicy.DetectImageMimeType([0xFF, 0xD8, 0xFF, 0xE0]));
-        Assert.Equal(
-            "image/png",
-            ScreenshotPolicy.DetectImageMimeType([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]));
-        Assert.Equal(
-            "image/webp",
-            ScreenshotPolicy.DetectImageMimeType("RIFF    WEBPVP8 "u8));
+        Assert.Equal("image/jpeg", ScreenshotPolicy.DetectImageMimeType(ImageFixtures.Jpeg));
+        Assert.Equal("image/png", ScreenshotPolicy.DetectImageMimeType(ImageFixtures.Png));
 
-        // A GIF is a real image and still refused: the contract names three formats,
+        // A GIF is a real image and still refused: the contract names two formats,
         // and quietly widening it would ship a MIME type the description does not
         // promise.
         Assert.Equal(
             TvErrorCode.TvError,
             Assert.Throws<TvException>(
-                () => ScreenshotPolicy.DetectImageMimeType("GIF89a......"u8)).Code);
+                () => ScreenshotPolicy.DetectImageMimeType("GIF89a\u0000\u0000\u0000"u8)).Code);
+
+        // WebP is refused deliberately: a RIFF length field can be made
+        // self-consistent over arbitrary content, so it cannot be validated to the
+        // standard the other two are held to.
+        Assert.Equal(
+            TvErrorCode.TvError,
+            Assert.Throws<TvException>(
+                () => ScreenshotPolicy.DetectImageMimeType("RIFFxxxxWEBPVP8 "u8)).Code);
+    }
+
+    // ------------------------------------------- completeness, not just a prefix
+
+    [Fact]
+    public void The_fixtures_really_are_images_and_not_magic_number_prefixes()
+    {
+        // Both were produced by a real encoder and decoded back to their original
+        // pixels before being embedded. If this ever reduces to "starts with the
+        // right bytes", every success test below stops proving anything.
+        Assert.Equal<byte[]>([0xFF, 0xD8, 0xFF], ImageFixtures.Jpeg[..3]);
+        Assert.Equal<byte[]>([0xFF, 0xD9], ImageFixtures.Jpeg[^2..]);
+        Assert.True(ImageFixtures.Jpeg.Length > 500);
+
+        Assert.Equal<byte[]>(
+            [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], ImageFixtures.Png[..8]);
+        Assert.Equal("IEND"u8.ToArray(), ImageFixtures.Png[^8..^4]);
+    }
+
+    [Fact]
+    public async Task A_jpeg_cut_short_is_TV_ERROR_even_though_its_signature_is_valid()
+    {
+        // The failure a magic-number check cannot see: a real capture whose
+        // connection dropped mid-body still starts with FF D8 FF. Reporting that as
+        // a successful capture hands back an image that will not open.
+        var harness = HarnessAnnouncing(CaptureUri);
+        harness.Downloader.Body = ImageFixtures.TruncatedJpeg;
+
+        Assert.Equal(TvErrorCode.TvError, await CodeOf(harness));
+    }
+
+    [Fact]
+    public async Task A_png_missing_its_IEND_chunk_is_TV_ERROR()
+    {
+        var harness = HarnessAnnouncing(CaptureUri);
+        harness.Downloader.Body = ImageFixtures.TruncatedPng;
+
+        Assert.Equal(TvErrorCode.TvError, await CodeOf(harness));
+    }
+
+    [Theory]
+    [InlineData(3)]
+    [InlineData(10)]
+    [InlineData(64)]
+    public void A_bare_signature_with_no_body_is_rejected(int prefixLength)
+    {
+        Assert.Equal(
+            TvErrorCode.TvError,
+            Assert.Throws<TvException>(
+                () => ScreenshotPolicy.DetectImageMimeType(ImageFixtures.Jpeg[..prefixLength])).Code);
+    }
+
+    [Fact]
+    public void A_jpeg_padded_with_trailing_nulls_after_its_EOI_is_still_accepted()
+    {
+        // Some transports pad to a block boundary. A bounded allowance accepts that
+        // without letting an arbitrary tail stand in for a missing terminator.
+        var padded = ImageFixtures.Jpeg.Concat(new byte[8]).ToArray();
+
+        Assert.Equal("image/jpeg", ScreenshotPolicy.DetectImageMimeType(padded));
+
+        // Past the allowance the terminator is no longer at the end, and the body is
+        // treated as truncated rather than padded.
+        var overPadded = ImageFixtures.Jpeg.Concat(new byte[64]).ToArray();
+
+        Assert.Throws<TvException>(() => ScreenshotPolicy.DetectImageMimeType(overPadded));
     }
 
     // ------------------------------------------------------ the real downloader
@@ -278,11 +348,11 @@ public sealed class ScreenshotTests
     {
         var handler = new ScriptedHttpHandler()
             .Redirect(HttpStatusCode.Found, $"http://{TvHost}:9080/tmp/real.jpg")
-            .Image(FakeScreenshotDownloader.SyntheticJpeg);
+            .Image(ImageFixtures.Jpeg);
 
         var bytes = await Downloader(handler).DownloadAsync(new Uri(CaptureUri), CancellationToken.None);
 
-        Assert.Equal(FakeScreenshotDownloader.SyntheticJpeg, bytes.ToArray());
+        Assert.Equal(ImageFixtures.Jpeg, bytes.ToArray());
         Assert.Equal(2, handler.Requests.Count);
     }
 
@@ -291,7 +361,7 @@ public sealed class ScreenshotTests
     {
         var handler = new ScriptedHttpHandler()
             .Redirect(HttpStatusCode.Found, "/tmp/real.jpg")
-            .Image(FakeScreenshotDownloader.SyntheticJpeg);
+            .Image(ImageFixtures.Jpeg);
 
         await Downloader(handler).DownloadAsync(new Uri(CaptureUri), CancellationToken.None);
 
@@ -303,12 +373,53 @@ public sealed class ScreenshotTests
     {
         var handler = new ScriptedHttpHandler()
             .Redirect(HttpStatusCode.Found, "https://example.invalid/capture.jpg")
-            .Image(FakeScreenshotDownloader.SyntheticJpeg);
+            .Image(ImageFixtures.Jpeg);
 
         Assert.Equal(TvErrorCode.InvalidInput, await DownloadCodeOf(handler));
 
         // Only the first hop was ever requested. Following it and then complaining
         // would already have leaked the request off the TV.
+        Assert.Equal([CaptureUri], handler.Requests);
+    }
+
+    [Theory]
+    [InlineData("ftp://192.0.2.10/capture.jpg")]
+    [InlineData("file:///tmp/capture.jpg")]
+    [InlineData("ws://192.0.2.10/capture.jpg")]
+    public async Task A_redirect_to_a_disallowed_scheme_is_INVALID_INPUT(string location)
+    {
+        // The blocker this closes: a first hop that passes every check can redirect
+        // to a target that passes none of them. Host pinning alone would have let
+        // file:// through, because the host matches.
+        var handler = new ScriptedHttpHandler()
+            .Redirect(HttpStatusCode.Found, location)
+            .Image(ImageFixtures.Jpeg);
+
+        Assert.Equal(TvErrorCode.InvalidInput, await DownloadCodeOf(handler));
+        Assert.Equal([CaptureUri], handler.Requests);
+    }
+
+    [Fact]
+    public async Task A_redirect_carrying_userinfo_is_INVALID_INPUT()
+    {
+        // Same host, valid scheme, embedded credentials. Only the full policy
+        // catches this, and the credentials would otherwise be sent by HttpClient.
+        var handler = new ScriptedHttpHandler()
+            .Redirect(HttpStatusCode.Found, $"http://user:pass@{TvHost}:9080/tmp/real.jpg")
+            .Image(ImageFixtures.Jpeg);
+
+        Assert.Equal(TvErrorCode.InvalidInput, await DownloadCodeOf(handler));
+        Assert.Equal([CaptureUri], handler.Requests);
+    }
+
+    [Fact]
+    public async Task A_redirect_to_an_over_long_target_is_INVALID_INPUT()
+    {
+        var handler = new ScriptedHttpHandler()
+            .Redirect(HttpStatusCode.Found, $"http://{TvHost}:9080/{new string('a', 4096)}.jpg")
+            .Image(ImageFixtures.Jpeg);
+
+        Assert.Equal(TvErrorCode.InvalidInput, await DownloadCodeOf(handler));
         Assert.Equal([CaptureUri], handler.Requests);
     }
 
@@ -354,7 +465,7 @@ public sealed class ScreenshotTests
 
         Assert.Equal(
             TvErrorCode.TvError,
-            await DownloadCodeOf(handler, options => options.ScreenshotMaxBytes = 64));
+            await DownloadCodeOf(handler, options => options.ScreenshotMaxBytes = WebosMcpOptions.MinScreenshotMaxBytes));
     }
 
     [Fact]
@@ -366,7 +477,30 @@ public sealed class ScreenshotTests
 
         Assert.Equal(
             TvErrorCode.TvError,
-            await DownloadCodeOf(handler, options => options.ScreenshotMaxBytes = 64));
+            await DownloadCodeOf(handler, options => options.ScreenshotMaxBytes = WebosMcpOptions.MinScreenshotMaxBytes));
+    }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(-1, WebosMcpOptions.DefaultScreenshotMaxBytes)]
+    [InlineData(WebosMcpOptions.DefaultScreenshotTimeoutSeconds, 0)]
+    public async Task The_downloader_reads_the_validated_limits_not_the_raw_ones(int seconds, int maxBytes)
+    {
+        // Without this, the range checks could all pass while the download still
+        // used the unchecked field — the property would be validated and unread.
+        var handler = new ScriptedHttpHandler().Image(ImageFixtures.Jpeg);
+
+        var ex = await Assert.ThrowsAsync<TvException>(
+            () => Downloader(handler, options =>
+            {
+                options.ScreenshotTimeoutSeconds = seconds;
+                options.ScreenshotMaxBytes = maxBytes;
+            }).DownloadAsync(new Uri(CaptureUri), CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.InvalidInput, ex.Code);
+
+        // Refused before the request, so a bad limit cannot half-run a capture.
+        Assert.Empty(handler.Requests);
     }
 
     [Fact]
@@ -378,6 +512,96 @@ public sealed class ScreenshotTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => Downloader(new ScriptedHttpHandler().Hang())
                 .DownloadAsync(new Uri(CaptureUri), cts.Token));
+    }
+
+    // ------------------------------------------------------- configured limits
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(int.MinValue)]
+    [InlineData(301)]
+    [InlineData(int.MaxValue)]
+    public void An_out_of_range_screenshot_timeout_is_rejected_not_clamped(int seconds)
+    {
+        // 0 and -1 are the dangerous ones: CancelAfter with a non-positive delay
+        // does not mean "no timeout" in the way an operator might expect, and a
+        // negative value throws from deep inside the download instead of being
+        // reported as the configuration error it is.
+        var options = new WebosMcpOptions { ScreenshotTimeoutSeconds = seconds };
+
+        var ex = Assert.Throws<TvException>(() => options.ResolvedScreenshotTimeoutSeconds);
+
+        Assert.Equal(TvErrorCode.InvalidInput, ex.Code);
+        Assert.Contains("WEBOSMCP__SCREENSHOTTIMEOUTSECONDS", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(1023)]
+    [InlineData(int.MaxValue)]
+    public void An_out_of_range_screenshot_size_cap_is_rejected_not_clamped(int bytes)
+    {
+        // A cap of 0 or a negative would make every capture fail; int.MaxValue would
+        // remove the memory bound the cap exists to provide.
+        var options = new WebosMcpOptions { ScreenshotMaxBytes = bytes };
+
+        var ex = Assert.Throws<TvException>(() => options.ResolvedScreenshotMaxBytes);
+
+        Assert.Equal(TvErrorCode.InvalidInput, ex.Code);
+        Assert.Contains("WEBOSMCP__SCREENSHOTMAXBYTES", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void The_accepted_range_boundaries_are_usable()
+    {
+        // The rejection tests above would also pass if everything were rejected.
+        Assert.Equal(
+            WebosMcpOptions.MinScreenshotTimeoutSeconds,
+            new WebosMcpOptions
+            {
+                ScreenshotTimeoutSeconds = WebosMcpOptions.MinScreenshotTimeoutSeconds,
+            }.ResolvedScreenshotTimeoutSeconds);
+
+        Assert.Equal(
+            WebosMcpOptions.MaxScreenshotTimeoutSeconds,
+            new WebosMcpOptions
+            {
+                ScreenshotTimeoutSeconds = WebosMcpOptions.MaxScreenshotTimeoutSeconds,
+            }.ResolvedScreenshotTimeoutSeconds);
+
+        Assert.Equal(
+            WebosMcpOptions.MinScreenshotMaxBytes,
+            new WebosMcpOptions
+            {
+                ScreenshotMaxBytes = WebosMcpOptions.MinScreenshotMaxBytes,
+            }.ResolvedScreenshotMaxBytes);
+
+        Assert.Equal(
+            WebosMcpOptions.MaxScreenshotMaxBytes,
+            new WebosMcpOptions
+            {
+                ScreenshotMaxBytes = WebosMcpOptions.MaxScreenshotMaxBytes,
+            }.ResolvedScreenshotMaxBytes);
+
+        Assert.Null(new WebosMcpOptions().ValidateScreenshotLimits());
+    }
+
+    [Fact]
+    public void The_startup_validator_names_the_offending_setting()
+    {
+        // A generic "configuration is invalid" would leave an operator guessing
+        // which of two settings is wrong and what range it should be in.
+        var validator = new ScreenshotLimitsValidator();
+
+        var result = validator.Validate(
+            null, new WebosMcpOptions { ScreenshotMaxBytes = 0 });
+
+        Assert.True(result.Failed);
+        Assert.Contains("WEBOSMCP__SCREENSHOTMAXBYTES", result.FailureMessage!, StringComparison.Ordinal);
+
+        Assert.True(validator.Validate(null, new WebosMcpOptions()).Succeeded);
     }
 
     // ------------------------------------------------------------- no leakage
@@ -430,7 +654,7 @@ public sealed class ScreenshotTests
         // Assigning raw bytes compiles, serialises to a well-formed "type":"image"
         // block, and produces a data field no client can decode. This asserts the
         // encoding rather than merely that a block was produced.
-        var bytes = FakeScreenshotDownloader.SyntheticJpeg;
+        var bytes = ImageFixtures.Jpeg;
 
         var block = ToolContent.Image(bytes, "image/jpeg");
 
@@ -451,7 +675,7 @@ public sealed class ScreenshotTests
 
         var block = Assert.IsType<ImageContentBlock>(Assert.Single(result.Content));
         Assert.Equal("image/jpeg", block.MimeType);
-        Assert.Equal(FakeScreenshotDownloader.SyntheticJpeg, block.DecodedData.ToArray());
+        Assert.Equal(ImageFixtures.Jpeg, block.DecodedData.ToArray());
     }
 
     [Fact]

@@ -1,10 +1,24 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using WebosMcp.Application;
 using WebosMcp.Infrastructure;
 using WebosMcp.Server.Tools;
 
 namespace WebosMcp.Server.Hosting;
+
+/// <summary>
+/// Turns an out-of-range screenshot limit into a startup failure that names the
+/// offending value. A generic "configuration is invalid" would leave an operator
+/// guessing which of two settings is wrong, and the range it should be in.
+/// </summary>
+public sealed class ScreenshotLimitsValidator : IValidateOptions<WebosMcpOptions>
+{
+    public ValidateOptionsResult Validate(string? name, WebosMcpOptions options) =>
+        options.ValidateScreenshotLimits() is { } problem
+            ? ValidateOptionsResult.Fail(problem)
+            : ValidateOptionsResult.Success;
+}
 
 public static class ServiceRegistration
 {
@@ -16,6 +30,12 @@ public static class ServiceRegistration
     public static IServiceCollection AddWebosMcp(this IServiceCollection services, IConfiguration configuration)
     {
         services.Configure<WebosMcpOptions>(configuration.GetSection(WebosMcpOptions.SectionName));
+
+        // Fail the server at startup on an out-of-range screenshot limit, rather
+        // than at the first capture. A bound that is only checked when it is first
+        // used is a bound nobody finds out is broken until it matters.
+        services.AddSingleton<IValidateOptions<WebosMcpOptions>, ScreenshotLimitsValidator>();
+        services.AddOptions<WebosMcpOptions>().ValidateOnStart();
 
         services.AddSingleton<ISsapConnectionFactory, SsapConnectionFactory>();
         services.AddSingleton<IWolSender, UdpWolSender>();
