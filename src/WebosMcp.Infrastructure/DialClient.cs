@@ -319,7 +319,29 @@ public sealed partial class DialClient : IDialClient, IDisposable
             // DIAL's "installable=..." state means the app is NOT installed.
             var installed = !state.StartsWith("installable", StringComparison.OrdinalIgnoreCase);
 
-            return new DialAppStatus(name ?? app, state, installed);
+            var allowStop = document.Descendants()
+                .FirstOrDefault(e => e.Name.LocalName.Equals("options", StringComparison.OrdinalIgnoreCase))
+                ?.Attributes()
+                .FirstOrDefault(a => a.Name.LocalName.Equals("allowStop", StringComparison.OrdinalIgnoreCase))
+                ?.Value;
+
+            // The running instance's address. Without it there is nothing to stop.
+            var runLink = document.Descendants()
+                .FirstOrDefault(e => e.Name.LocalName.Equals("link", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(
+                        e.Attributes().FirstOrDefault(a => a.Name.LocalName.Equals("rel", StringComparison.OrdinalIgnoreCase))?.Value,
+                        "run",
+                        StringComparison.OrdinalIgnoreCase))
+                ?.Attributes()
+                .FirstOrDefault(a => a.Name.LocalName.Equals("href", StringComparison.OrdinalIgnoreCase))
+                ?.Value;
+
+            return new DialAppStatus(
+                name ?? app,
+                state,
+                installed,
+                AllowStop: string.Equals(allowStop, "true", StringComparison.OrdinalIgnoreCase),
+                RunLink: string.IsNullOrWhiteSpace(runLink) ? null : runLink.Trim());
         }
         catch (System.Xml.XmlException)
         {
@@ -356,6 +378,54 @@ public sealed partial class DialClient : IDialClient, IDisposable
         {
             throw TvException.Unreachable($"DIAL launch of '{app}' failed: {ex.Message}", ex);
         }
+    }
+
+    public async Task<bool> StopAppAsync(
+        Uri applicationUrl,
+        string app,
+        string runLink,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Delete, InstanceUrl(applicationUrl, app, runLink));
+
+        if (OriginFor(app) is { } origin)
+        {
+            request.Headers.TryAddWithoutValidation("Origin", origin);
+        }
+
+        try
+        {
+            using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+
+            if (response.IsSuccessStatusCode)
+            {
+                return true;
+            }
+
+            _logger.LogWarning(
+                "DIAL stop of '{App}' was rejected with {Status}.", app, (int)response.StatusCode);
+            return false;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
+        {
+            throw TvException.Unreachable($"DIAL stop of '{app}' failed: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// The running instance address. DIAL gives <c>href</c> relative to the app URL,
+    /// but a TV is free to return an absolute one, so both are handled.
+    /// </summary>
+    internal static Uri InstanceUrl(Uri applicationUrl, string app, string runLink)
+    {
+        // Standard URI resolution, so all three shapes a TV may return are handled:
+        // "run" appends to the app URL, "/apps/YouTube/run" resolves against the
+        // authority (appending it would produce a doubled path), and an absolute
+        // href is used as-is. The trailing slash is what makes the relative case
+        // append rather than replace the last segment.
+        var appUrl = new Uri(Combine(applicationUrl, app).AbsoluteUri.TrimEnd('/') + "/");
+
+        return new Uri(appUrl, runLink);
     }
 
     private static Uri Combine(Uri applicationUrl, string app)

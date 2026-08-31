@@ -18,9 +18,20 @@ public sealed class FakeDialClient : IDialClient
     /// <summary>False simulates the TV rejecting the launch POST.</summary>
     public bool LaunchAccepted { get; set; } = true;
 
+    /// <summary>False simulates the TV rejecting the DIAL stop (DELETE).</summary>
+    public bool StopAccepted { get; set; } = true;
+
+    /// <summary>
+    /// True simulates a TV that accepts the stop but never actually stops the app —
+    /// the case where a cold start is impossible and success must not be reported.
+    /// </summary>
+    public bool StopLeavesAppRunning { get; set; }
+
     public int ResolveCount { get; private set; }
 
     public int LaunchCount { get; private set; }
+
+    public int StopCount { get; private set; }
 
     public List<string> LaunchPayloads { get; } = [];
 
@@ -40,5 +51,19 @@ public sealed class FakeDialClient : IDialClient
         LaunchCount++;
         LaunchPayloads.Add(payload);
         return Task.FromResult(LaunchAccepted);
+    }
+
+    public Task<bool> StopAppAsync(
+        Uri applicationUrl, string app, string runLink, CancellationToken cancellationToken)
+    {
+        StopCount++;
+
+        if (StopAccepted && !StopLeavesAppRunning && AppStatus is { } current)
+        {
+            // A real stop makes the next status report a stopped app.
+            AppStatus = current with { State = "stopped" };
+        }
+
+        return Task.FromResult(StopAccepted);
     }
 }

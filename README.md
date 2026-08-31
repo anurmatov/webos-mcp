@@ -328,7 +328,7 @@ registered by default**. Every tool returns
 | `tv_launch_app` | Launch an app by id. |
 | `tv_close_app` | Close a running app. |
 | `tv_open_url` | Open an **HTTPS-only** URL in the webOS browser. |
-| `tv_youtube_play` | Play a video by id, `youtu.be` link or watch URL. Launches over **DIAL** and confirms YouTube reached the foreground before reporting success. |
+| `tv_youtube_play` | Play a video by id, `youtu.be` link or watch URL. Launches over **DIAL**, cold-starting YouTube if it is already running, and confirms the app reached the foreground before reporting success. |
 | `tv_youtube_search` | **Not supported** — always returns `TV_UNSUPPORTED_CAPABILITY`. See below. |
 
 Content tools report which path ran — `"path": "DeepLink"` or `"path": "Dial"`.
@@ -337,6 +337,24 @@ Content tools report which path ran — `"path": "DeepLink"` or `"path": "Dial"`
 the DIAL launch it polls the TV's own foreground-app report and only succeeds
 once YouTube actually appears. A launch the TV accepted but never acted on is
 reported as a failure, naming the app that was actually in the foreground.
+
+**A running YouTube session is stopped and cold-started.** A DIAL launch aimed
+at an app that is *already running* does not change what it is playing — the TV
+accepts the request and the previous video keeps going. Physical testing hit
+exactly that, and because YouTube was already in the foreground the old
+foreground check passed instantly and it was reported as success. So when
+YouTube is running, the tool now stops it over DIAL, waits for it to actually
+stop, and starts it cold with the requested video. Where the TV does not permit
+that — no `allowStop`, no instance link, or a stop that is accepted but never
+takes effect — the tool returns `TV_UNSUPPORTED_CAPABILITY` and does **not**
+launch. Expect the screen to go briefly to the home screen and back.
+
+**`exactVideoConfirmed` is always `false` on the DIAL path, by design.** DIAL
+exposes no way to read back which video is on screen. The video id is delivered
+to a freshly started app, which is what makes it take effect, but that is not
+the same as observing it play — so the response says so rather than letting a
+bare "success" imply proof. `coldStarted` reports whether a running session had
+to be restarted.
 
 **`tv_youtube_search` is deliberately unsupported.** Physical testing showed
 YouTube's custom on-screen keyboard silently ignoring
@@ -527,6 +545,14 @@ Specifically **not** claimed:
 - That every TV exposes a DIAL endpoint. Where it does not, `tv_youtube_play`
   reports `TV_UNSUPPORTED_CAPABILITY` rather than falling back to something
   unverifiable.
+- That the video reported as launched is the video on screen. DIAL cannot read
+  back the playing video; `exactVideoConfirmed` is always `false` on this path
+  and is not a claim we make. Confirming exactness would need the YouTube Lounge
+  API, which pairs through Google's cloud and is deliberately out of scope for a
+  local-first server — see the rejected alternatives in issue #1.
+- That a running YouTube session can always be stopped. `allowStop` is a
+  per-app, per-firmware option; without it the requested video cannot be made to
+  replace what is playing, and the tool says so instead of launching anyway.
 - That the built-in `WEBOSMCP__DIALPORTS` list covers every model. `2038` is
   what LG webOS was observed using, not a value from a specification. If your
   TV advertises DIAL somewhere else, set `WEBOSMCP__DIALAPPLICATIONURL` or add
@@ -574,6 +600,14 @@ correct, since every non-multicast strategy depends on it. Then run an SSDP
 reply, and either add that port to `WEBOSMCP__DIALPORTS` or set
 `WEBOSMCP__DIALAPPLICATIONURL` to it directly. The server logs which ports it
 probed when resolution fails.
+
+**`tv_youtube_play` returns `TV_UNSUPPORTED_CAPABILITY` saying YouTube is
+already running and cannot be stopped.**
+The TV does not advertise `allowStop` for YouTube, or exposes no running-instance
+link. A DIAL launch cannot change the video of a running session, so honouring
+the request is impossible on this firmware. Stop YouTube on the TV (back out to
+the home screen) and call the tool again — from a stopped app the launch payload
+takes effect normally.
 
 **`tv_youtube_play` fails naming HTTP 403.**
 The DIAL endpoint was found, and the TV refused the request. DIAL application

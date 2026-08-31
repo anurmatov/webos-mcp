@@ -62,14 +62,24 @@ public sealed class AppTools
     [Description(
         "Play a YouTube video by bare 11-character video id, youtu.be link or youtube.com watch URL. " +
         "Launches over DIAL and reports success only after confirming YouTube reached the foreground — " +
-        "an accepted launch alone is never reported as success. Returns TV_UNSUPPORTED_CAPABILITY when " +
-        "the TV exposes no DIAL endpoint or YouTube is not installed.")]
+        "an accepted launch alone is never reported as success. If YouTube is already running it is " +
+        "stopped and cold-started, because a DIAL launch cannot change the video of a running session. " +
+        "Returns TV_UNSUPPORTED_CAPABILITY when the TV exposes no DIAL endpoint, YouTube is not " +
+        "installed, or a running session cannot be stopped. Note exactVideoConfirmed is always false: " +
+        "DIAL cannot report which video is on screen, so the response never claims read-back proof.")]
     public Task<ToolResult> YouTubePlay(
         [Description("YouTube video id or URL.")] string video,
         CancellationToken cancellationToken) =>
         ToolInvoker.RunAsync(_logger, "tv_youtube_play", async () =>
         {
             var result = await _tv.PlayYouTubeAsync(video, cancellationToken);
-            return new { path = result.Path.ToString(), detail = result.Detail, appId = result.AppId };
+            return new
+            {
+                path = result.Path.ToString(),
+                detail = result.Detail,
+                appId = result.AppId,
+                exactVideoConfirmed = result.ExactVideoConfirmed,
+                coldStarted = result.ColdStarted,
+            };
         });
 }

@@ -5,7 +5,18 @@ using WebosMcp.Domain;
 
 namespace WebosMcp.Application;
 
-public sealed record ContentActionResult(ActionPath Path, string Detail, string? AppId = null);
+/// <param name="ExactVideoConfirmed">
+/// Whether the requested video was observed to be the one playing. DIAL cannot
+/// report the playing video, so this is false on every DIAL path — the caller is
+/// told plainly rather than left to read success as a read-back confirmation.
+/// </param>
+/// <param name="ColdStarted">Whether a running app had to be stopped and restarted for the request to take effect.</param>
+public sealed record ContentActionResult(
+    ActionPath Path,
+    string Detail,
+    string? AppId = null,
+    bool ExactVideoConfirmed = false,
+    bool ColdStarted = false);
 
 /// <summary>
 /// The shared capability layer. Both transports (stdio and Streamable HTTP)
@@ -339,6 +350,51 @@ public sealed class TvControlService
             throw TvException.Unsupported("the YouTube DIAL application (it is not installed on this TV)");
         }
 
+        // A DIAL launch aimed at an ALREADY-RUNNING app does not change what it is
+        // playing: the TV accepts the request, the app stays foreground, and the
+        // previous video keeps going. Physical testing hit exactly this, and because
+        // the only check was "is YouTube in the foreground" — already true — it was
+        // reported as success. Foreground identity is not evidence of the video.
+        //
+        // The only way DIAL can make a specific video take effect is a cold start,
+        // so a running instance is stopped first. Where that is not possible, the
+        // honest answer is that this TV cannot do it — never a launch dressed up as
+        // playback.
+        var restarted = false;
+
+        if (status.IsRunning)
+        {
+            if (!status.CanStop)
+            {
+                throw new TvException(
+                    TvErrorCode.TvUnsupportedCapability,
+                    $"YouTube is already running and this TV does not allow DIAL to stop it " +
+                    $"(allowStop={status.AllowStop.ToString().ToLowerInvariant()}, " +
+                    $"instance link {(status.RunLink is null ? "absent" : "present")}). " +
+                    $"A DIAL launch cannot change the video of a running session, so '{videoId}' cannot " +
+                    "be made to play. Stop YouTube on the TV and try again.");
+            }
+
+            if (!await _dial.StopAppAsync(applicationUrl, DialYouTubeApp, status.RunLink!, ct).ConfigureAwait(false))
+            {
+                throw new TvException(
+                    TvErrorCode.TvUnsupportedCapability,
+                    $"YouTube is already running and the TV refused the DIAL stop, so '{videoId}' cannot " +
+                    "be made to replace what is currently playing.");
+            }
+
+            if (!await WaitUntilStoppedAsync(applicationUrl, ct).ConfigureAwait(false))
+            {
+                throw new TvException(
+                    TvErrorCode.TvUnsupportedCapability,
+                    $"The DIAL stop for YouTube was accepted but the app was still running after " +
+                    $"{_options.LaunchVerifyTimeoutSeconds}s, so a cold start with '{videoId}' could not " +
+                    "be performed. Reporting failure rather than launching over the old session.");
+            }
+
+            restarted = true;
+        }
+
         var accepted = await _dial.LaunchAppAsync(
             applicationUrl, DialYouTubeApp, $"v={Uri.EscapeDataString(videoId)}", ct).ConfigureAwait(false);
 
@@ -368,11 +424,49 @@ public sealed class TvControlService
                 "Reporting failure rather than an unverified success.");
         }
 
+        // What was actually observed: YouTube was cold-started and reached the
+        // foreground carrying this video id as its launch payload. What was NOT
+        // observed: the video now on screen. DIAL exposes no way to read back the
+        // playing video, so exactness is stated as unconfirmed rather than implied
+        // by a bare "success".
+        var how = restarted
+            ? "Stopped the running YouTube session, relaunched it cold"
+            : "Launched YouTube";
+
         return new ContentActionResult(
             ActionPath.Dial,
-            $"Launched video '{videoId}' over DIAL and confirmed YouTube reached the foreground " +
-            $"(app '{evidence.ForegroundAppId}') after {evidence.ElapsedSeconds:0.0}s.",
-            evidence.ForegroundAppId);
+            $"{how} with video '{videoId}' over DIAL and confirmed YouTube reached the foreground " +
+            $"(app '{evidence.ForegroundAppId}') after {evidence.ElapsedSeconds:0.0}s. " +
+            "The video id was delivered to a freshly started app, which is what makes it take effect; " +
+            "DIAL cannot report which video is on screen, so this is not a read-back confirmation.",
+            evidence.ForegroundAppId,
+            ExactVideoConfirmed: false,
+            ColdStarted: restarted);
+    }
+
+    /// <summary>
+    /// Polls DIAL until the app reports a non-running state. Bounded by the same
+    /// budget as launch verification.
+    /// </summary>
+    private async Task<bool> WaitUntilStoppedAsync(Uri applicationUrl, CancellationToken ct)
+    {
+        var interval = TimeSpan.FromSeconds(Math.Max(1, _options.LaunchPollIntervalSeconds));
+        var budget = TimeSpan.FromSeconds(Math.Max(1, _options.LaunchVerifyTimeoutSeconds));
+        var maxAttempts = (int)Math.Ceiling(budget.TotalSeconds / interval.TotalSeconds);
+
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            var status = await _dial.GetAppStatusAsync(applicationUrl, DialYouTubeApp, ct).ConfigureAwait(false);
+
+            if (status is null || !status.IsRunning)
+            {
+                return true;
+            }
+
+            await _delay.DelayAsync(interval, ct).ConfigureAwait(false);
+        }
+
+        return false;
     }
 
     /// <summary>

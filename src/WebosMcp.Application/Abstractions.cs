@@ -82,10 +82,26 @@ public interface IClientKeyStore
 public sealed record DiscoveredTv(string Address, string? FriendlyName, string? ModelName);
 
 /// <summary>State of a DIAL application on the TV.</summary>
-public sealed record DialAppStatus(string Name, string State, bool Installed)
+/// <param name="AllowStop">
+/// The app's DIAL <c>allowStop</c> option. Without it the app cannot be stopped
+/// over DIAL, and therefore cannot be cold-started with a new video.
+/// </param>
+/// <param name="RunLink">
+/// The <c>rel="run"</c> href of a running instance, relative to the app URL. This
+/// is the only address a DIAL stop can be sent to.
+/// </param>
+public sealed record DialAppStatus(
+    string Name,
+    string State,
+    bool Installed,
+    bool AllowStop = false,
+    string? RunLink = null)
 {
     public bool IsRunning => State.Equals("running", StringComparison.OrdinalIgnoreCase)
         || State.Equals("starting", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether a running instance can be stopped, which is what makes a cold restart possible.</summary>
+    public bool CanStop => AllowStop && !string.IsNullOrWhiteSpace(RunLink);
 }
 
 /// <summary>
@@ -122,6 +138,18 @@ public interface IDialClient
         Uri applicationUrl,
         string app,
         string payload,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// DELETEs a running app instance. Returns true when the TV accepted the stop.
+    /// Needed because launching over an already-running app does NOT change what it
+    /// is playing — the payload is ignored — so the only way to make a requested
+    /// video take effect is to stop the app and start it cold.
+    /// </summary>
+    Task<bool> StopAppAsync(
+        Uri applicationUrl,
+        string app,
+        string runLink,
         CancellationToken cancellationToken);
 }
 
