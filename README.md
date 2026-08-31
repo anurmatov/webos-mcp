@@ -152,7 +152,7 @@ You can point the server at a TV entirely through MCP — no `WEBOSMCP__HOST`,
 
 | Tool | What it does |
 |---|---|
-| `tv_discover_devices` | Scan the LAN. Returns candidates with MAC and broadcast address already derived where the network can supply them. Registers nothing. |
+| `tv_discover_devices` | Scan the LAN by SSDP, or pass an address to probe it directly. Registers nothing. |
 | `tv_register_device` | Register an address and make it active. Derives MAC and broadcast; re-registering a known address updates it. |
 | `tv_list_devices` | Registered TVs and which is active. |
 | `tv_select_device` | Switch the active TV. Takes effect immediately, no restart. |
@@ -173,9 +173,19 @@ the kind of thing that costs an afternoon to debug.
 **Accepting the pairing prompt on the TV is still a human step**, deliberately. It
 is the boundary that stops anything pairing unattended.
 
-Where the MAC cannot be derived (the neighbour table has no entry, or the tool is
-absent in a minimal container), registration still succeeds and says so —
-`tv_power_on` is simply unavailable until you supply one with `tv_update_device`.
+**In a container, scan discovery finds nothing — that is expected.** SSDP is
+multicast and does not cross a Docker bridge network. Pass the TV's address to
+`tv_discover_devices` to probe it directly (a unicast TCP connect, which does
+cross), or skip straight to `tv_register_device`. Neither needs multicast. An
+empty scan says all this in its `hint` rather than returning a bare empty list,
+which reads as "there is no TV".
+
+**Registration never fails because an address detail could not be derived.** On a
+bridge network the TV is not on the same segment, so its MAC is not in the
+neighbour table — and a minimal container image has no `ping` binary either. The
+device is persisted regardless, and the response reports
+`wakeOnLanAvailable: false` with what to do about it: everything works except
+`tv_power_on`, which needs a MAC supplied via `tv_update_device`.
 
 ---
 

@@ -30,14 +30,39 @@ public sealed class DeviceTools
 
     [McpServerTool(Name = "tv_discover_devices")]
     [Description(
-        "Scan the local network for webOS TVs. Returns candidates with their address and, where the " +
-        "network can supply them, the MAC and broadcast address needed for Wake-on-LAN. Registers " +
-        "nothing — pass an address to tv_register_device to keep it.")]
-    public Task<ToolResult> Discover(CancellationToken cancellationToken) =>
+        "Find webOS TVs. With no argument, scans by SSDP multicast — which does NOT cross a Docker " +
+        "bridge network, so in a container pass the TV's address instead to probe it directly. " +
+        "Returns candidates with MAC and broadcast address derived where the network can supply them. " +
+        "Registers nothing; pass an address to tv_register_device to keep it.")]
+    public Task<ToolResult> Discover(
+        [Description("Optional TV address to probe directly instead of scanning. Works in a container.")]
+        string? host,
+        CancellationToken cancellationToken) =>
         ToolInvoker.RunAsync(_logger, "tv_discover_devices", async () =>
         {
+            if (!string.IsNullOrWhiteSpace(host))
+            {
+                var probed = await _devices.ProbeAsync(host, cancellationToken);
+
+                return new
+                {
+                    count = probed is null ? 0 : 1,
+                    devices = probed is null ? new List<object>() : [Describe(probed)],
+                    hint = probed is null
+                        ? $"Nothing answered on '{host}'. Check the address and that the TV is on with " +
+                          "network control enabled."
+                        : null,
+                };
+            }
+
             var found = await _devices.DiscoverAsync(cancellationToken);
-            return new { count = found.Count, devices = found.Select(Describe).ToList() };
+
+            return new
+            {
+                count = found.Devices.Count,
+                devices = found.Devices.Select(Describe).ToList(),
+                hint = found.Hint,
+            };
         });
 
     [McpServerTool(Name = "tv_register_device")]
@@ -59,7 +84,16 @@ public sealed class DeviceTools
                 active = true,
                 derivedMac = device.MacAddress is not null,
                 derivedBroadcast = device.BroadcastAddress is not null,
-                nextStep = "Run the pair flow and accept the prompt on the TV.",
+
+                // Registration succeeds without a MAC. Saying plainly that only
+                // Wake-on-LAN is affected stops it reading as a failed setup.
+                wakeOnLanAvailable = device.MacAddress is not null,
+                nextStep = device.MacAddress is null
+                    ? "Registered. The MAC address could not be derived — this is normal in a container, " +
+                      "where the TV is not on the same network segment. Everything works except " +
+                      "tv_power_on; supply a MAC with tv_update_device to enable it. Next, run the pair " +
+                      "flow and accept the prompt on the TV."
+                    : "Registered. Next, run the pair flow and accept the prompt on the TV.",
             };
         });
 

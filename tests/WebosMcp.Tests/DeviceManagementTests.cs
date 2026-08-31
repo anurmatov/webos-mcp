@@ -48,9 +48,19 @@ public sealed class DeviceManagementTests
 
         public string? Broadcast { get; set; } = "192.0.2.255";
 
-        public string? TryGetMacAddress(string host) => Mac;
+        /// <summary>Thrown from derivation — the container with no ping binary did exactly this.</summary>
+        public Exception? DerivationFailure { get; set; }
 
-        public string? TryGetBroadcastAddress(string host) => Broadcast;
+        public bool Reachable { get; set; } = true;
+
+        public string? TryGetMacAddress(string host) =>
+            DerivationFailure is not null ? throw DerivationFailure : Mac;
+
+        public string? TryGetBroadcastAddress(string host) =>
+            DerivationFailure is not null ? throw DerivationFailure : Broadcast;
+
+        public Task<bool> IsReachableAsync(string host, int port, CancellationToken ct) =>
+            Task.FromResult(Reachable);
     }
 
     private static (DeviceService Service, InMemoryDeviceStore Store, FakeDiscovery Discovery,
@@ -73,7 +83,7 @@ public sealed class DeviceManagementTests
         var (service, _, discovery, _, _) = Build();
         discovery.Found.Add(new DiscoveredTv("192.0.2.10", "Living Room", "OLED55"));
 
-        var device = Assert.Single(await service.DiscoverAsync(CancellationToken.None));
+        var device = Assert.Single((await service.DiscoverAsync(CancellationToken.None)).Devices);
 
         Assert.Equal("192.0.2.10", device.Host);
         Assert.Equal("00:11:22:33:44:55", device.MacAddress);
@@ -92,6 +102,100 @@ public sealed class DeviceManagementTests
 
         Assert.Empty(store.Book.Devices);
         Assert.Equal(0, store.Saves);
+    }
+
+    [Fact]
+    public async Task An_empty_scan_explains_that_multicast_does_not_cross_a_container_bridge()
+    {
+        // Physical acceptance hit exactly this: zero devices on a Docker bridge. A
+        // bare empty list reads as "there is no TV" and sends the operator hunting
+        // for a fault that is not there.
+        var (service, _, _, _, _) = Build();
+
+        var result = await service.DiscoverAsync(CancellationToken.None);
+
+        Assert.Empty(result.Devices);
+        Assert.NotNull(result.Hint);
+        Assert.Contains("multicast", result.Hint, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("tv_register_device", result.Hint, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_successful_scan_carries_no_hint()
+    {
+        var (service, _, discovery, _, _) = Build();
+        discovery.Found.Add(new DiscoveredTv("192.0.2.10", null, null));
+
+        Assert.Null((await service.DiscoverAsync(CancellationToken.None)).Hint);
+    }
+
+    // ---- the container-reliable route --------------------------------------
+
+    [Fact]
+    public async Task Probing_an_address_directly_finds_a_TV_without_any_multicast()
+    {
+        // A unicast TCP connect crosses a bridge network where SSDP does not, so
+        // this is the route that actually works in a container.
+        var (service, _, _, _, _) = Build();
+
+        var device = await service.ProbeAsync("192.0.2.10", CancellationToken.None);
+
+        Assert.NotNull(device);
+        Assert.Equal("192.0.2.10", device!.Host);
+        Assert.Equal("00:11:22:33:44:55", device.MacAddress);
+    }
+
+    [Fact]
+    public async Task Probing_an_address_that_does_not_answer_yields_nothing()
+    {
+        var (service, _, _, network, _) = Build();
+        network.Reachable = false;
+
+        Assert.Null(await service.ProbeAsync("192.0.2.10", CancellationToken.None));
+    }
+
+    // ---- derivation failure must never block registration ------------------
+
+    [Fact]
+    public async Task Registration_persists_the_device_even_when_MAC_derivation_THROWS()
+    {
+        // The physical blocker: the container image has no ping binary, Ping threw
+        // PlatformNotSupportedException, it escaped, and nothing was persisted —
+        // a nice-to-have taking down the whole onboarding path.
+        var (service, store, _, network, options) = Build();
+        network.DerivationFailure =
+            new PlatformNotSupportedException("The system's ping utility could not be found.");
+
+        var device = await service.RegisterAsync("192.0.2.10", "Living Room", true, CancellationToken.None);
+
+        Assert.Null(device.MacAddress);
+        Assert.Equal("192.0.2.10", Assert.Single(store.Book.Devices).Host);
+        Assert.Equal("192.0.2.10", options.Host);
+    }
+
+    [Fact]
+    public async Task Discovery_still_returns_candidates_when_derivation_throws()
+    {
+        var (service, _, discovery, network, _) = Build();
+        discovery.Found.Add(new DiscoveredTv("192.0.2.10", "Living Room", null));
+        network.DerivationFailure = new PlatformNotSupportedException("no ping");
+
+        var device = Assert.Single((await service.DiscoverAsync(CancellationToken.None)).Devices);
+
+        Assert.Equal("192.0.2.10", device.Host);
+        Assert.Null(device.MacAddress);
+    }
+
+    [Fact]
+    public async Task A_probe_survives_a_derivation_failure_too()
+    {
+        var (service, _, _, network, _) = Build();
+        network.DerivationFailure = new PlatformNotSupportedException("no ping");
+
+        var device = await service.ProbeAsync("192.0.2.10", CancellationToken.None);
+
+        Assert.NotNull(device);
+        Assert.Null(device!.MacAddress);
     }
 
     // ---- registration derives instead of asking ----------------------------

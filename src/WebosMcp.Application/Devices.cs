@@ -45,7 +45,21 @@ public interface INetworkFacts
 
     /// <summary>The directed broadcast address of the local subnet containing <paramref name="host"/>.</summary>
     string? TryGetBroadcastAddress(string host);
+
+    /// <summary>
+    /// Whether a TCP connection to this address and port succeeds. Unlike SSDP, a
+    /// unicast TCP connect crosses a Docker bridge network, so this is the discovery
+    /// route that actually works in a container.
+    /// </summary>
+    Task<bool> IsReachableAsync(string host, int port, CancellationToken cancellationToken);
 }
+
+/// <param name="Hint">
+/// Set when the scan found nothing, explaining what to do instead. A bare empty
+/// list reads as "there is no TV", when the real cause is usually that multicast
+/// did not leave the container.
+/// </param>
+public sealed record DeviceDiscoveryResult(IReadOnlyList<TvDevice> Devices, string? Hint = null);
 
 /// <summary>
 /// Device registration and selection.
@@ -78,17 +92,44 @@ public sealed class DeviceService
     /// Scans for TVs and enriches each with the address details registration needs,
     /// so the operator picks a device rather than assembling one.
     /// </summary>
-    public async Task<IReadOnlyList<TvDevice>> DiscoverAsync(CancellationToken ct)
+    public async Task<DeviceDiscoveryResult> DiscoverAsync(CancellationToken ct)
     {
         var found = await _discovery
             .DiscoverAsync(TimeSpan.FromSeconds(Math.Max(1, _options.DialSsdpTimeoutSeconds)), ct)
             .ConfigureAwait(false);
 
-        return found.Select(tv => Enrich(new TvDevice(
+        var devices = found.Select(tv => Enrich(new TvDevice(
             Id: DeviceId(tv.Address),
             Host: tv.Address,
             FriendlyName: tv.FriendlyName,
             ModelName: tv.ModelName))).ToList();
+
+        // An empty scan is far more often "multicast did not leave the container"
+        // than "there is no TV", and reporting a bare empty list sends the operator
+        // looking for a fault that is not there.
+        var hint = devices.Count > 0
+            ? null
+            : "No TV answered the SSDP scan. Discovery relies on multicast, which does not cross a " +
+              "Docker bridge network — so this is expected in a container unless it runs with " +
+              "network_mode: host. Pass the TV's address to this tool to probe it directly, or call " +
+              "tv_register_device with the address; neither needs multicast.";
+
+        return new DeviceDiscoveryResult(devices, hint);
+    }
+
+    /// <summary>
+    /// Checks one address directly. This is the container-reliable route: a unicast
+    /// TCP connect crosses a bridge network where SSDP multicast does not.
+    /// </summary>
+    public async Task<TvDevice?> ProbeAsync(string host, CancellationToken ct)
+    {
+        var address = Require(host);
+
+        var reachable = await _network
+            .IsReachableAsync(address, _options.Port, ct)
+            .ConfigureAwait(false);
+
+        return reachable ? Enrich(new TvDevice(DeviceId(address), address)) : null;
     }
 
     public async Task<DeviceBook> ListAsync(CancellationToken ct) =>
@@ -234,11 +275,40 @@ public sealed class DeviceService
         return active;
     }
 
-    private TvDevice Enrich(TvDevice device) => device with
+    /// <summary>
+    /// Adds derived address details. Derivation is a convenience and is wrapped
+    /// here as well as in the provider: an implementation that throws — the
+    /// container image with no ping binary did — must not be able to stop a device
+    /// being registered.
+    /// </summary>
+    private TvDevice Enrich(TvDevice device)
     {
-        MacAddress = device.MacAddress ?? _network.TryGetMacAddress(device.Host),
-        BroadcastAddress = device.BroadcastAddress ?? _network.TryGetBroadcastAddress(device.Host),
-    };
+        string? mac = null;
+        string? broadcast = null;
+
+        try
+        {
+            mac = _network.TryGetMacAddress(device.Host);
+        }
+        catch (Exception)
+        {
+            // Undeterminable, not fatal.
+        }
+
+        try
+        {
+            broadcast = _network.TryGetBroadcastAddress(device.Host);
+        }
+        catch (Exception)
+        {
+        }
+
+        return device with
+        {
+            MacAddress = device.MacAddress ?? mac,
+            BroadcastAddress = device.BroadcastAddress ?? broadcast,
+        };
+    }
 
     private async Task SaveAndApplyAsync(DeviceBook book, CancellationToken ct)
     {

@@ -60,6 +60,7 @@ public sealed class LoungeClient : ILoungeClient
             _http,
             new Uri(_options.LoungeBaseUrl.TrimEnd('/')),
             token,
+            screenId,
             _options.LoungeDeviceName,
             _loggerFactory.CreateLogger<LoungeSession>());
 
@@ -148,8 +149,8 @@ internal sealed class LoungeSession : ILoungeSession
     private readonly HttpClient _http;
     private readonly Uri _baseUrl;
     private readonly string _loungeToken;
+    private readonly string _screenId;
     private readonly string _deviceName;
-    private readonly string _deviceId = Guid.NewGuid().ToString("N");
     private readonly ILogger<LoungeSession> _logger;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
@@ -162,30 +163,42 @@ internal sealed class LoungeSession : ILoungeSession
         HttpClient http,
         Uri baseUrl,
         string loungeToken,
+        string screenId,
         string deviceName,
         ILogger<LoungeSession> logger)
     {
         _http = http;
         _baseUrl = baseUrl;
         _loungeToken = loungeToken;
+        _screenId = screenId;
         _deviceName = deviceName;
         _logger = logger;
     }
 
-    /// <summary>Opens the channel and captures the session ids every later call needs.</summary>
+    /// <summary>
+    /// Opens the channel and captures the session ids every later call needs.
+    ///
+    /// The handshake shape is load-bearing and was established against real
+    /// hardware: the receiver and device metadata go in the POST FORM BODY — with
+    /// the receiver's own screen id as <c>id</c> — and only the channel parameters
+    /// stay in the query. An earlier revision put the metadata in the query with a
+    /// random client id and posted a bare <c>count=0</c>; the receiver refused it,
+    /// so every YouTube tool failed at bind while a reference client controlling the
+    /// same receiver connected immediately.
+    /// </summary>
     public async Task<bool> BindAsync(CancellationToken cancellationToken)
     {
-        var url = BuildUrl(new Dictionary<string, string>
+        using var request = new HttpRequestMessage(HttpMethod.Post, BuildBindUrl())
         {
-            ["RID"] = Interlocked.Increment(ref _requestId).ToString(CultureInfo.InvariantCulture),
-            ["CVER"] = "1",
-        });
+            Content = new FormUrlEncodedContent(BuildBindFields()),
+        };
 
-        using var content = new FormUrlEncodedContent([new KeyValuePair<string, string>("count", "0")]);
+        // Also presented as a header, which is how reference clients authenticate.
+        request.Headers.TryAddWithoutValidation("X-YouTube-LoungeId-Token", _loungeToken);
 
         try
         {
-            using var response = await _http.PostAsync(url, content, cancellationToken).ConfigureAwait(false);
+            using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -200,13 +213,48 @@ internal sealed class LoungeSession : ILoungeSession
                 CaptureSessionIds(element);
             }
 
-            return _sessionId is not null && _gSessionId is not null;
+            if (_sessionId is null || _gSessionId is null)
+            {
+                _logger.LogWarning("The Lounge bind response carried no session ids; the receiver cannot be controlled.");
+                return false;
+            }
+
+            return true;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
             throw TvException.Unreachable($"Could not bind a YouTube Lounge session: {ex.Message}", ex);
         }
     }
+
+    /// <summary>
+    /// Only the channel parameters. The token deliberately does NOT go here — it
+    /// belongs in the form body, which also keeps it out of any URL that request
+    /// logging might print.
+    /// </summary>
+    internal Uri BuildBindUrl() => new(
+        _baseUrl,
+        $"{BindPath}?RID={Uri.EscapeDataString(Interlocked.Increment(ref _requestId).ToString(CultureInfo.InvariantCulture))}" +
+        "&VER=8&CVER=1&auth_failure_option=send_error");
+
+    /// <summary>
+    /// The bind form body. <c>id</c> is the RECEIVER's screen id, not a client-side
+    /// identifier: that is what ties this remote to the running session.
+    /// </summary>
+    internal IReadOnlyList<KeyValuePair<string, string>> BuildBindFields() =>
+    [
+        new("app", "webos-mcp"),
+        new("mdx-version", "3"),
+        new("name", _deviceName),
+        new("id", _screenId),
+        new("device", "REMOTE_CONTROL"),
+        new("capabilities", "que,dsdtr,atp"),
+        new("method", "setPlaylist"),
+        new("magnaKey", "cloudPairedDevice"),
+        new("ui", "false"),
+        new("theme", "cl"),
+        new("loungeIdToken", _loungeToken),
+    ];
 
     public async Task SendAsync(
         string command,
@@ -239,8 +287,13 @@ internal sealed class LoungeSession : ILoungeSession
                 fields.Add(new KeyValuePair<string, string>($"req0_{key}", value));
             }
 
-            using var content = new FormUrlEncodedContent(fields);
-            using var response = await _http.PostAsync(url, content, cancellationToken).ConfigureAwait(false);
+            using var request = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Content = new FormUrlEncodedContent(fields),
+            };
+            request.Headers.TryAddWithoutValidation("X-YouTube-LoungeId-Token", _loungeToken);
+
+            using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -280,7 +333,12 @@ internal sealed class LoungeSession : ILoungeSession
 
             try
             {
-                using var response = await _http.GetAsync(url, cancellationToken).ConfigureAwait(false);
+                using var eventRequest = new HttpRequestMessage(HttpMethod.Get, url);
+                eventRequest.Headers.TryAddWithoutValidation("X-YouTube-LoungeId-Token", _loungeToken);
+
+                using var response = await _http
+                    .SendAsync(eventRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                    .ConfigureAwait(false);
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -328,7 +386,7 @@ internal sealed class LoungeSession : ILoungeSession
             ["VER"] = "8",
             ["app"] = "webos-mcp",
             ["name"] = _deviceName,
-            ["id"] = _deviceId,
+            ["id"] = _screenId,
             ["loungeIdToken"] = _loungeToken,
             ["t"] = "1",
         };
@@ -348,28 +406,44 @@ internal sealed class LoungeSession : ILoungeSession
         return new Uri(_baseUrl, $"{BindPath}?{encoded}");
     }
 
+    /// <summary>
+    /// Reads the session ids out of a bind response entry.
+    ///
+    /// The framing is [id, [name, value, ...]] — the same envelope every event uses
+    /// — so the name is in the INNER array. Reading the outer element's first slot
+    /// finds the numeric event id and never matches, which is how this silently
+    /// captured nothing.
+    /// </summary>
     private void CaptureSessionIds(JsonElement element)
     {
-        // Session ids arrive as ["c", "<SID>", ...] and ["S", "<gsessionid>"].
         if (element.ValueKind != JsonValueKind.Array || element.GetArrayLength() < 2)
         {
             return;
         }
 
-        var head = element[0];
-        if (head.ValueKind != JsonValueKind.String)
+        var payload = element[1];
+        if (payload.ValueKind != JsonValueKind.Array || payload.GetArrayLength() < 2)
         {
             return;
         }
 
-        var value = element[1];
-
-        switch (head.GetString())
+        if (payload[0].ValueKind != JsonValueKind.String)
         {
-            case "c" when value.ValueKind == JsonValueKind.String:
+            return;
+        }
+
+        var value = payload[1];
+        if (value.ValueKind != JsonValueKind.String)
+        {
+            return;
+        }
+
+        switch (payload[0].GetString())
+        {
+            case "c":
                 _sessionId = value.GetString();
                 break;
-            case "S" when value.ValueKind == JsonValueKind.String:
+            case "S":
                 _gSessionId = value.GetString();
                 break;
         }

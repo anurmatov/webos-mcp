@@ -78,6 +78,40 @@ public sealed class ScriptedDialHttpHandler : HttpMessageHandler
 }
 
 /// <summary>
+/// Records the full request — URL and form body — so the Lounge handshake's wire
+/// shape can be asserted rather than assumed. The shape is what the receiver
+/// actually validates, so nothing else proves it.
+/// </summary>
+public sealed class CapturingLoungeHandler : HttpMessageHandler
+{
+    private readonly Queue<(HttpStatusCode Status, string Body)> _responses;
+
+    public CapturingLoungeHandler(params (HttpStatusCode Status, string Body)[] responses) =>
+        _responses = new Queue<(HttpStatusCode, string)>(responses);
+
+    public List<(string Url, string Body, string? TokenHeader)> Requests { get; } = [];
+
+    protected override async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        var body = request.Content is null
+            ? string.Empty
+            : await request.Content.ReadAsStringAsync(cancellationToken);
+
+        request.Headers.TryGetValues("X-YouTube-LoungeId-Token", out var token);
+
+        Requests.Add((request.RequestUri!.AbsoluteUri, body, token?.FirstOrDefault()));
+
+        var (status, responseBody) = _responses.Count > 0
+            ? _responses.Dequeue()
+            : (HttpStatusCode.OK, string.Empty);
+
+        return new HttpResponseMessage(status) { Content = new StringContent(responseBody) };
+    }
+}
+
+/// <summary>
 /// A scripted SSDP responder. Keyed by target endpoint so a test can give the
 /// unicast address an answer while leaving multicast silent — which is exactly
 /// the container case that broke DIAL resolution.

@@ -107,20 +107,51 @@ public sealed class SystemNetworkFacts : INetworkFacts
             return null;
         }
 
+        // Catch EVERYTHING. A MAC is a convenience: deriving it must never be able
+        // to stop a device being registered. The container image has no ping binary,
+        // so Ping threw PlatformNotSupportedException, the exception escaped, and
+        // registration failed outright — a nice-to-have taking down the whole
+        // onboarding path.
         try
         {
-            // Prime the neighbour table: an address never spoken to has no entry.
-            using (var ping = new Ping())
-            {
-                ping.Send(address, 500);
-            }
-
+            PrimeNeighbourTable(address);
             return ReadNeighbourTable(address.ToString());
         }
-        catch (Exception ex) when (ex is PingException or SocketException or InvalidOperationException)
+        catch (Exception ex)
         {
             _logger.LogDebug("Could not derive a MAC address for {Host}: {Message}", host, ex.Message);
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Nudges the OS into populating its neighbour table for this address. Uses a
+    /// plain socket rather than Ping, because Ping shells out to a system binary
+    /// that minimal container images do not ship.
+    /// </summary>
+    private static void PrimeNeighbourTable(IPAddress address)
+    {
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            socket.Blocking = false;
+
+            try
+            {
+                // Connect is expected to fail or block; the ARP exchange it triggers
+                // is the entire point.
+                socket.Connect(new IPEndPoint(address, 3000));
+            }
+            catch (SocketException)
+            {
+                // Expected for a non-blocking connect.
+            }
+
+            Thread.Sleep(150);
+        }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException or NotSupportedException)
+        {
+            // Priming is best-effort; the table may already hold an entry.
         }
     }
 
@@ -154,9 +185,10 @@ public sealed class SystemNetworkFacts : INetworkFacts
                     return mac;
                 }
             }
-            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+            catch (Exception)
             {
-                // Tool absent — try the next one.
+                // Tool absent, not permitted, or unsupported on this platform —
+                // try the next one, and fall through to null.
             }
         }
 
@@ -186,6 +218,24 @@ public sealed class SystemNetworkFacts : INetworkFacts
         }
 
         return null;
+    }
+
+    public async Task<bool> IsReachableAsync(string host, int port, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(3));
+
+            await socket.ConnectAsync(host, port, timeout.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception)
+        {
+            // Unreachable, refused, or not a resolvable address. All mean "no TV here".
+            return false;
+        }
     }
 
     public string? TryGetBroadcastAddress(string host)
@@ -221,8 +271,9 @@ public sealed class SystemNetworkFacts : INetworkFacts
                 }
             }
         }
-        catch (NetworkInformationException ex)
+        catch (Exception ex)
         {
+            // Same rule as the MAC: a derivation failure never blocks registration.
             _logger.LogDebug("Could not derive a broadcast address for {Host}: {Message}", host, ex.Message);
         }
 
