@@ -226,21 +226,26 @@ public sealed partial class DialClient : IDialClient, IDisposable
         string app,
         CancellationToken cancellationToken)
     {
-        var target = Combine(applicationUrl, app);
+        using var request = BuildRequest(HttpMethod.Get, applicationUrl, app);
 
         try
         {
-            using var response = await _http.GetAsync(target, cancellationToken).ConfigureAwait(false);
+            using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
 
             if (response.StatusCode == HttpStatusCode.NotFound)
             {
-                // DIAL reports a not-installed app as 404.
+                // DIAL reports a not-installed app as 404. This is the ONLY status
+                // that means "not installed".
                 return null;
             }
 
             if (!response.IsSuccessStatusCode)
             {
-                return null;
+                // Anything else is the TV refusing or failing, not the app being
+                // absent. Collapsing 403 into null told the caller "YouTube is not
+                // installed" about a TV with YouTube installed, which sent the last
+                // physical run chasing the wrong fault entirely.
+                throw new TvException(TvErrorCode.TvError, DescribeRejection("status", app, response.StatusCode));
             }
 
             var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
@@ -251,6 +256,47 @@ public sealed partial class DialClient : IDialClient, IDisposable
             throw TvException.Unreachable($"Could not read DIAL status for '{app}': {ex.Message}", ex);
         }
     }
+
+    /// <summary>
+    /// Names the HTTP status, and for 403 says what actually causes it. DIAL
+    /// application endpoints are origin-checked: without the sender origin the
+    /// app expects, the TV answers 403 whether or not the app is installed.
+    /// </summary>
+    private static string DescribeRejection(string operation, string app, HttpStatusCode code)
+    {
+        var detail = $"The TV rejected the DIAL {operation} request for '{app}' with HTTP {(int)code}.";
+
+        return code == HttpStatusCode.Forbidden
+            ? detail + " A DIAL 403 is an authorisation refusal, not a missing app — the app is most " +
+              "likely installed but rejected the sender origin."
+            : detail;
+    }
+
+    /// <summary>
+    /// DIAL application requests are origin-checked. YouTube's DIAL endpoint
+    /// refuses a sender that does not present its origin, so the header is sent
+    /// on the application calls (status and launch) — never on the device
+    /// description probes, which are not application requests.
+    /// </summary>
+    private static HttpRequestMessage BuildRequest(HttpMethod method, Uri applicationUrl, string app)
+    {
+        var request = new HttpRequestMessage(method, Combine(applicationUrl, app));
+
+        if (OriginFor(app) is { } origin)
+        {
+            request.Headers.TryAddWithoutValidation("Origin", origin);
+        }
+
+        return request;
+    }
+
+    /// <summary>
+    /// The authorised sender origin for an app, or null when none is known. Kept
+    /// per-app deliberately: sending YouTube's origin to some other app would be
+    /// a lie about who is calling.
+    /// </summary>
+    internal static string? OriginFor(string app) =>
+        app.Equals("YouTube", StringComparison.OrdinalIgnoreCase) ? "https://www.youtube.com" : null;
 
     internal static DialAppStatus? ParseAppStatus(string app, string body)
     {
@@ -287,13 +333,12 @@ public sealed partial class DialClient : IDialClient, IDisposable
         string payload,
         CancellationToken cancellationToken)
     {
-        var target = Combine(applicationUrl, app);
-
-        using var content = new StringContent(payload, Encoding.UTF8, "application/x-www-form-urlencoded");
+        using var request = BuildRequest(HttpMethod.Post, applicationUrl, app);
+        request.Content = new StringContent(payload, Encoding.UTF8, "application/x-www-form-urlencoded");
 
         try
         {
-            using var response = await _http.PostAsync(target, content, cancellationToken).ConfigureAwait(false);
+            using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
 
             if (response.IsSuccessStatusCode)
             {
@@ -302,7 +347,10 @@ public sealed partial class DialClient : IDialClient, IDisposable
 
             _logger.LogWarning(
                 "DIAL launch of '{App}' was rejected with {Status}.", app, (int)response.StatusCode);
-            return false;
+
+            // Throw rather than return false: the status is the diagnostic, and a
+            // bare false discards it.
+            throw new TvException(TvErrorCode.TvError, DescribeRejection("launch", app, response.StatusCode));
         }
         catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
         {

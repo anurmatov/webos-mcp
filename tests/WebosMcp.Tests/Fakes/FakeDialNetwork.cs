@@ -40,6 +40,43 @@ public sealed class StubDialHttpHandler : HttpMessageHandler
     }
 }
 
+public sealed record RecordedRequest(string Method, string Url, string? Origin);
+
+/// <summary>
+/// Returns a scripted status for DIAL application calls and records what was sent,
+/// so tests can assert both the response handling and the request headers.
+/// </summary>
+public sealed class ScriptedDialHttpHandler : HttpMessageHandler
+{
+    private readonly HttpStatusCode _status;
+    private readonly string _body;
+
+    public ScriptedDialHttpHandler(HttpStatusCode status, string body = "")
+    {
+        _status = status;
+        _body = body;
+    }
+
+    public List<RecordedRequest> Requests { get; } = [];
+
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        request.Headers.TryGetValues("Origin", out var origin);
+
+        Requests.Add(new RecordedRequest(
+            request.Method.Method,
+            request.RequestUri!.AbsoluteUri,
+            origin?.FirstOrDefault()));
+
+        return Task.FromResult(new HttpResponseMessage(_status)
+        {
+            Content = new StringContent(_body),
+        });
+    }
+}
+
 /// <summary>
 /// A scripted SSDP responder. Keyed by target endpoint so a test can give the
 /// unicast address an answer while leaving multicast silent — which is exactly

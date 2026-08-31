@@ -575,6 +575,15 @@ reply, and either add that port to `WEBOSMCP__DIALPORTS` or set
 `WEBOSMCP__DIALAPPLICATIONURL` to it directly. The server logs which ports it
 probed when resolution fails.
 
+**`tv_youtube_play` fails naming HTTP 403.**
+The DIAL endpoint was found, and the TV refused the request. DIAL application
+endpoints are origin-checked: the server sends `Origin: https://www.youtube.com`
+on the YouTube status and launch calls for exactly this reason. A 403 that
+survives that is an authorisation refusal from the TV — it does **not** mean
+YouTube is missing, and the server no longer reports it as such. Check that
+"LG Connect Apps" / network control is still enabled and that the TV is not in
+a restricted or store-demo mode.
+
 **The server refuses to start with "Refusing to start".**
 You set a non-loopback `WEBOS_MCP_HTTP_BIND` without a token. Set
 `WEBOS_MCP_HTTP_TOKEN` / `WEBOS_MCP_HTTP_TOKEN_FILE`, or bind to `127.0.0.1`.

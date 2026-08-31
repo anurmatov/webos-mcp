@@ -102,12 +102,21 @@ public interface IDialClient
     /// </summary>
     Task<Uri?> ResolveApplicationUrlAsync(CancellationToken cancellationToken);
 
-    /// <summary>Reads an application's DIAL status, or null when it is not installed.</summary>
+    /// <summary>
+    /// Reads an application's DIAL status. Null means, and only means, the app is
+    /// not installed (DIAL 404). Any other refusal — notably a 403, which is an
+    /// origin/authorisation failure and says nothing about whether the app is
+    /// installed — is reported as <see cref="TvErrorCode.TvError"/> naming the
+    /// HTTP status, never flattened into "not installed".
+    /// </summary>
     Task<DialAppStatus?> GetAppStatusAsync(Uri applicationUrl, string app, CancellationToken cancellationToken);
 
     /// <summary>
     /// POSTs a launch request. Returns true only when the TV accepted it
-    /// (2xx). Acceptance alone is NOT treated as success by callers.
+    /// (2xx). Acceptance alone is NOT treated as success by callers. A rejection
+    /// is reported as <see cref="TvErrorCode.TvError"/> naming the HTTP status;
+    /// returning false is also permitted for implementations with no status to
+    /// report.
     /// </summary>
     Task<bool> LaunchAppAsync(
         Uri applicationUrl,
