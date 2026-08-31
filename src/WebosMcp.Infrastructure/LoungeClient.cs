@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using WebosMcp.Application;
@@ -320,25 +321,38 @@ internal sealed class LoungeSession : ILoungeSession
     }
 
     /// <summary>
-    /// Opens the event stream and returns only once the receiver has ACCEPTED the
-    /// poll — response headers back, success status. That acceptance is the readiness
-    /// barrier: from the moment this returns, the channel is registered server-side
-    /// and anything the receiver announces lands on a stream that is already open.
+    /// Opens the event stream, STARTS CONSUMING IT, and returns only once the read
+    /// loop is actually running against the receiver's stream.
+    ///
+    /// Readiness comes from the pump, not from the response headers. Headers coming
+    /// back only says the request was accepted — nobody is reading yet, and a
+    /// receiver that delivers an announcement to whoever is listening at that instant
+    /// has nobody to deliver it to. The barrier is therefore the pump having ISSUED
+    /// ITS FIRST READ on the stream: from that moment there is a reader outstanding
+    /// and the announcement lands somewhere. Waiting for the first chunk instead
+    /// would deadlock, because the stream is legitimately silent until the command
+    /// this barrier exists to precede.
+    ///
+    /// Once running, the pump parses continuously into a buffer that
+    /// <see cref="LoungeSubscription.ReadAsync"/> drains, so an event announced
+    /// before the caller starts reading is held rather than lost.
     ///
     /// This exists because the opposite order silently loses events. The receiver
-    /// announces a state change once, as it happens; a poll opened after the command
-    /// can miss the announcement entirely, and the tool then reports a video that is
-    /// visibly playing as never observed. A sleep between command and poll would not
-    /// fix it either — it asserts that enough time has passed rather than confirming
-    /// the stream is open, so it is both slower and still a race.
+    /// announces a state change once, as it happens; a stream opened — or merely
+    /// accepted — after the command can miss the announcement entirely, and the tool
+    /// then reports a video that is visibly playing as never observed. A sleep would
+    /// not fix it either: it asserts that enough time has passed rather than
+    /// confirming anything is reading, so it is both slower and still a race.
     /// </summary>
     public async Task<ILoungeSubscription> SubscribeAsync(CancellationToken cancellationToken)
     {
-        // Bounded on its own, separate from the verification budget: failing to open
-        // the stream means nothing was sent to the receiver at all, which is a
-        // different report from a command that went out unconfirmed.
+        // Bounded on its own, separate from the verification budget: failing to get
+        // the stream reading means nothing was sent to the receiver at all, which is
+        // a different report from a command that went out unconfirmed.
+        var seconds = Math.Max(1, _subscribeTimeoutSeconds);
+
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        budget.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, _subscribeTimeoutSeconds)));
+        budget.CancelAfter(TimeSpan.FromSeconds(seconds));
 
         var poll = await OpenPollAsync(0, budget.Token).ConfigureAwait(false);
 
@@ -348,12 +362,42 @@ internal sealed class LoungeSession : ILoungeSession
 
             throw new TvException(
                 TvErrorCode.TvError,
-                "The YouTube receiver did not open its event stream within " +
-                $"{Math.Max(1, _subscribeTimeoutSeconds)}s, so nothing it was asked to do could be " +
-                "verified. No command was sent.");
+                $"The YouTube receiver did not open its event stream within {seconds}s, so nothing it " +
+                "was asked to do could be verified. No command was sent.");
         }
 
-        return new LoungeSubscription(this, poll.Value.Response, poll.Value.Stream);
+        var subscription = new LoungeSubscription(this, poll.Value.Response, poll.Value.Stream);
+
+        try
+        {
+            // Headers are already back at this point. This is the part that matters:
+            // it returns only once the pump has a read outstanding on the stream.
+            if (await subscription.StartAsync(budget.Token).ConfigureAwait(false))
+            {
+                return subscription;
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            await subscription.DisposeAsync().ConfigureAwait(false);
+
+            throw new TvException(
+                TvErrorCode.TvError,
+                $"The YouTube receiver's event stream did not begin delivering within {seconds}s, so " +
+                "nothing it was asked to do could be verified. No command was sent.");
+        }
+        catch
+        {
+            await subscription.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+
+        await subscription.DisposeAsync().ConfigureAwait(false);
+
+        throw new TvException(
+            TvErrorCode.TvError,
+            "The YouTube receiver's event stream ended before anything could be read from it, so " +
+            "nothing it was asked to do could be verified. No command was sent.");
     }
 
     /// <summary>
@@ -692,8 +736,27 @@ internal sealed class LoungeSubscription : ILoungeSubscription
 {
     private readonly LoungeSession _session;
 
+    /// <summary>
+    /// Holds what the pump has parsed but the caller has not drained yet. Without
+    /// it, an event announced between subscribing and the caller reading would be
+    /// parsed and dropped — the same loss this class exists to prevent, moved one
+    /// layer up.
+    /// </summary>
+    private readonly Channel<LoungeReceiverState> _states =
+        Channel.CreateUnbounded<LoungeReceiverState>(new UnboundedChannelOptions { SingleWriter = true });
+
+    /// <summary>
+    /// True once the pump has a read outstanding; false if it ended without ever
+    /// managing one. This is the readiness signal, and it comes from the pump itself.
+    /// </summary>
+    private readonly TaskCompletionSource<bool> _reading =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private readonly CancellationTokenSource _stop = new();
+
     private HttpResponseMessage? _response;
     private Stream? _stream;
+    private Task? _pump;
     private int _lastEventId;
 
     public LoungeSubscription(LoungeSession session, HttpResponseMessage response, Stream stream)
@@ -703,18 +766,34 @@ internal sealed class LoungeSubscription : ILoungeSubscription
         _stream = stream;
     }
 
-    public async IAsyncEnumerable<LoungeReceiverState> ReadAsync(
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+    /// <summary>
+    /// Starts the pump and waits for it to report that it is reading. False means it
+    /// ended without ever issuing a read; cancellation of <paramref name="readinessBudget"/>
+    /// means it did not get there in time. Either way the caller must not send a
+    /// command — there would be nothing listening for the answer.
+    ///
+    /// The budget bounds only this wait. The pump itself runs for the life of the
+    /// subscription and is stopped by <see cref="DisposeAsync"/>.
+    /// </summary>
+    internal async Task<bool> StartAsync(CancellationToken readinessBudget)
+    {
+        _pump = Task.Run(() => PumpAsync(_stop.Token), CancellationToken.None);
+
+        return await _reading.Task.WaitAsync(readinessBudget).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads the stream continuously from the moment the subscription starts, rather
+    /// than when the caller gets round to enumerating. That is the whole point: the
+    /// receiver announces once, to whoever is listening at that instant.
+    /// </summary>
+    private async Task PumpAsync(CancellationToken cancellationToken)
     {
         // Taken, not copied: the established poll is consumed exactly once, and
         // disposal must not close a stream this loop still owns.
         var response = Interlocked.Exchange(ref _response, null);
         var stream = Interlocked.Exchange(ref _stream, null);
 
-        // try/finally rather than `using` on the locals: the established poll is
-        // taken out of the fields above, so an exit that never enters the loop —
-        // an already-cancelled token, or the consumer abandoning the enumerator —
-        // would otherwise leave it open with nothing left holding a reference to it.
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -729,7 +808,7 @@ internal sealed class LoungeSubscription : ILoungeSubscription
 
                     if (poll is null)
                     {
-                        yield break;
+                        return;
                     }
 
                     response = poll.Value.Response;
@@ -748,9 +827,27 @@ internal sealed class LoungeSubscription : ILoungeSubscription
 
                 while (true)
                 {
-                    var read = await LoungeSession
-                        .ReadAsync(stream, buffer, cancellationToken)
-                        .ConfigureAwait(false);
+                    // Deliberately not awaited on this line. Calling it issues the
+                    // read, so the signal below is set while a reader is genuinely
+                    // outstanding on the stream — which is what readiness means here.
+                    // Awaiting first and signalling after would only ever report
+                    // readiness once an event had ALREADY arrived, and the stream is
+                    // silent until the command this barrier precedes.
+                    var pending = LoungeSession.ReadAsync(stream, buffer, cancellationToken);
+
+                    // A read that has ALREADY completed is not an outstanding reader:
+                    // the stream either had something buffered or has ended, and in
+                    // neither case is anything waiting on the receiver's next
+                    // announcement. Signalling here would call a dead stream ready and
+                    // let a command go out that nothing could verify. The next
+                    // iteration's read is the one that will be pending — or the loop
+                    // exits and readiness resolves false.
+                    if (!pending.IsCompleted)
+                    {
+                        _reading.TrySetResult(true);
+                    }
+
+                    var read = await pending.ConfigureAwait(false);
 
                     if (read <= 0)
                     {
@@ -761,7 +858,7 @@ internal sealed class LoungeSubscription : ILoungeSubscription
 
                     foreach (var state in chunks.Append(buffer.AsSpan(0, read)))
                     {
-                        yield return state;
+                        _states.Writer.TryWrite(state);
                     }
                 }
 
@@ -774,13 +871,35 @@ internal sealed class LoungeSubscription : ILoungeSubscription
                 if (!readAny)
                 {
                     // The channel closed with nothing at all; re-polling would spin.
-                    yield break;
+                    return;
                 }
             }
+        }
+        catch (OperationCanceledException)
+        {
+            // Disposal, or the caller giving up. Not a fault.
         }
         finally
         {
             await ClosePollAsync(response, stream).ConfigureAwait(false);
+
+            // Unblocks a subscriber still waiting on readiness for a pump that never
+            // got there, so it fails fast instead of sitting out the whole budget.
+            _reading.TrySetResult(false);
+            _states.Writer.TryComplete();
+        }
+    }
+
+    /// <summary>
+    /// Drains what the pump has parsed. Everything announced since the subscription
+    /// started is here, in order, whether or not the caller was reading at the time.
+    /// </summary>
+    public async IAsyncEnumerable<LoungeReceiverState> ReadAsync(
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var state in _states.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        {
+            yield return state;
         }
     }
 
@@ -796,12 +915,27 @@ internal sealed class LoungeSubscription : ILoungeSubscription
 
     public async ValueTask DisposeAsync()
     {
-        // Non-null only when the stream was established and never read — an early
-        // failure between subscribing and sending. Leaving it open would hold a poll
-        // against the receiver for nothing. Once reading starts these are null and
-        // the reader's own finally owns the cleanup.
+        await _stop.CancelAsync().ConfigureAwait(false);
+
+        if (_pump is { } pump)
+        {
+            try
+            {
+                await pump.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected on disposal.
+            }
+        }
+
+        // Non-null only when the pump never started — a failure between opening the
+        // stream and getting it reading. Leaving it open would hold a poll against
+        // the receiver for nothing.
         await ClosePollAsync(
             Interlocked.Exchange(ref _response, null),
             Interlocked.Exchange(ref _stream, null)).ConfigureAwait(false);
+
+        _stop.Dispose();
     }
 }

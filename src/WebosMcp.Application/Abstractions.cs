@@ -179,16 +179,20 @@ public interface ILoungeSession : IAsyncDisposable
         CancellationToken cancellationToken);
 
     /// <summary>
-    /// Opens the receiver's event stream and returns only once it is ESTABLISHED —
-    /// the receiver has accepted the poll and is feeding it.
+    /// Opens the receiver's event stream, starts consuming it, and returns only once
+    /// a read is actually OUTSTANDING on it.
     ///
     /// The ordering this enables is the whole point: a command must never be sent
-    /// before the stream that will report its effect is open. The receiver announces
-    /// a state change once, as it happens, so a subscription opened afterwards can
-    /// miss it entirely — which is how a video that really did start playing was
-    /// reported as never observed. This returning is the readiness barrier; there is
-    /// deliberately no sleep anywhere near it, because a sleep asserts a delay rather
-    /// than confirming a fact.
+    /// before something is listening for its effect. The receiver announces a state
+    /// change once, as it happens, to whoever is reading at that instant — so a
+    /// stream opened afterwards, or merely accepted but unread, can miss it entirely.
+    /// That is how a video which really did start playing was reported as never
+    /// observed.
+    ///
+    /// Response headers are NOT the barrier. They say the request was accepted, not
+    /// that anyone is reading. Nor is a sleep: it asserts a delay rather than
+    /// confirming a fact. This returning is the barrier, and it means the pump is
+    /// running.
     /// </summary>
     Task<ILoungeSubscription> SubscribeAsync(CancellationToken cancellationToken);
 }

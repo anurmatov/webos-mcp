@@ -85,9 +85,24 @@ public sealed class ScriptedDialHttpHandler : HttpMessageHandler
 public sealed class CapturingLoungeHandler : HttpMessageHandler
 {
     private readonly Queue<(HttpStatusCode Status, string Body)> _responses;
+    private readonly HttpStatusCode? _pollStatus;
 
-    public CapturingLoungeHandler(params (HttpStatusCode Status, string Body)[] responses) =>
+    public CapturingLoungeHandler(params (HttpStatusCode Status, string Body)[] responses)
+        : this(null, responses)
+    {
+    }
+
+    /// <summary>
+    /// <paramref name="pollStatus"/> forces the event poll's status, for asserting how
+    /// a refused subscription is reported. Null serves it normally.
+    /// </summary>
+    public CapturingLoungeHandler(
+        HttpStatusCode? pollStatus,
+        params (HttpStatusCode Status, string Body)[] responses)
+    {
+        _pollStatus = pollStatus;
         _responses = new Queue<(HttpStatusCode, string)>(responses);
+    }
 
     public List<(string Url, string Body, string? TokenHeader)> Requests { get; } = [];
 
@@ -102,6 +117,18 @@ public sealed class CapturingLoungeHandler : HttpMessageHandler
         request.Headers.TryGetValues("X-YouTube-LoungeId-Token", out var token);
 
         Requests.Add((request.RequestUri!.AbsoluteUri, body, token?.FirstOrDefault()));
+
+        // The event poll is the only GET this client issues, and it is a LONG poll —
+        // it must stay open with a read outstanding, not end immediately. Serving it
+        // an empty body would make every subscription look like a stream that died
+        // on contact, which is a different thing entirely.
+        if (request.Method == HttpMethod.Get)
+        {
+            return new HttpResponseMessage(_pollStatus ?? HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new HandoffStream()),
+            };
+        }
 
         var (status, responseBody) = _responses.Count > 0
             ? _responses.Dequeue()

@@ -162,6 +162,24 @@ public sealed class YouTubeLoungeTests
     }
 
     [Fact]
+    public async Task An_open_stream_that_is_NOT_pumping_observes_nothing()
+    {
+        // Headers back is not readiness. This is that state exactly: the subscription
+        // exists and the stream is open, but nothing is reading it, so the receiver's
+        // single announcement lands nowhere. Subscribing must not return until the
+        // pump is engaged — with this knob set, it hasn't been, and the tool correctly
+        // reports failure instead of a video it never observed.
+        var harness = Ready(Playing(Video));
+        harness.Lounge.Session!.SubscribeWithoutEngaging = true;
+
+        var error = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvError, error.Code);
+        Assert.Contains("never reported it playing", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Observed_control_commands_also_subscribe_before_they_send()
     {
         // Not just play: every command judged on an announced event has the same

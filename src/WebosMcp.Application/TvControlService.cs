@@ -401,13 +401,14 @@ public sealed class TvControlService
 
         await using var session = await ConnectLoungeAsync(screenId, ct).ConfigureAwait(false);
 
-        // The event stream is established BEFORE the command, and this returning is
-        // the barrier — the receiver has accepted the poll and is feeding it. The
-        // receiver announces the video change once, as it happens, so opening the
-        // stream afterwards can miss the announcement outright: that is how a video
-        // physically playing on the TV was reported as never observed. No sleep is
-        // used or wanted here; a sleep asserts elapsed time instead of confirming the
-        // stream is open, which leaves the same race with worse latency.
+        // The event stream is opened AND ACTIVELY READ before the command, and this
+        // returning is the barrier — a read is outstanding on it. The receiver
+        // announces the video change once, as it happens, to whoever is listening at
+        // that instant, so a stream opened afterwards — or merely accepted, headers
+        // back, with nothing reading it — can miss the announcement outright. That is
+        // how a video physically playing on the TV was reported as never observed. No
+        // sleep is used or wanted here; a sleep asserts elapsed time instead of
+        // confirming anything is reading, which leaves the same race, slower.
         await using var subscription = await session.SubscribeAsync(ct).ConfigureAwait(false);
 
         await session.SendAsync(

@@ -44,6 +44,14 @@ public sealed class FakeLoungeSession : ILoungeSession
     /// <summary>Set to have the receiver never open its event stream.</summary>
     public Exception? SubscribeFailure { get; set; }
 
+    /// <summary>
+    /// Hands back a subscription whose pump never engaged — the stream is open and
+    /// the object exists, but nothing is reading it. This is precisely what a
+    /// headers-only readiness barrier produces, and it must not be treated as an
+    /// active subscriber.
+    /// </summary>
+    public bool SubscribeWithoutEngaging { get; set; }
+
     public Task SendAsync(
         string command,
         IReadOnlyDictionary<string, string>? parameters,
@@ -57,8 +65,9 @@ public sealed class FakeLoungeSession : ILoungeSession
             return Task.FromException(SendFailure);
         }
 
-        // Announced only to streams that were already open. A subscription opened
-        // after this point has missed them, exactly as on the real receiver.
+        // Announced only to subscriptions that are ACTIVELY PUMPING. One that merely
+        // exists — stream open, nothing reading — has nobody to hand the
+        // announcement to and drops it, exactly as on the real receiver.
         foreach (var subscription in _open)
         {
             foreach (var report in Reports)
@@ -82,6 +91,13 @@ public sealed class FakeLoungeSession : ILoungeSession
         var subscription = new FakeLoungeSubscription();
         _open.Add(subscription);
 
+        // Mirrors the real contract: subscribing returns only once the pump is
+        // reading. Remove this and every observation test fails, which is the point.
+        if (!SubscribeWithoutEngaging)
+        {
+            subscription.Engage();
+        }
+
         return Task.FromResult<ILoungeSubscription>(subscription);
     }
 
@@ -93,9 +109,15 @@ public sealed class FakeLoungeSession : ILoungeSession
 }
 
 /// <summary>
-/// One open event stream. Reports queued into it are delivered in order; when there
-/// are none it blocks until the caller's budget expires, which is what a receiver
-/// that never confirms looks like.
+/// One event stream. Reports announced to it while it is PUMPING are delivered in
+/// order; when there are none it blocks until the caller's budget expires, which is
+/// what a receiver that never confirms looks like.
+///
+/// The engaged/not-engaged distinction is the fake's whole reason for existing in
+/// this shape. An open stream with nothing reading it is not a subscriber — that was
+/// the second fault in this thread, after the ordering one: the barrier waited for
+/// response headers, so the command went out while the pump had not started and the
+/// receiver's single announcement had nowhere to land.
 /// </summary>
 public sealed class FakeLoungeSubscription : ILoungeSubscription
 {
@@ -103,7 +125,18 @@ public sealed class FakeLoungeSubscription : ILoungeSubscription
 
     public bool Disposed { get; private set; }
 
-    internal void Announce(LoungeReceiverState state) => _reports.Writer.TryWrite(state);
+    /// <summary>Whether the pump is running. Announcements to a stream that is not are lost.</summary>
+    public bool Engaged { get; private set; }
+
+    internal void Engage() => Engaged = true;
+
+    internal void Announce(LoungeReceiverState state)
+    {
+        if (Engaged)
+        {
+            _reports.Writer.TryWrite(state);
+        }
+    }
 
     public async IAsyncEnumerable<LoungeReceiverState> ReadAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken)

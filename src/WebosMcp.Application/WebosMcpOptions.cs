@@ -79,11 +79,16 @@ public sealed class WebosMcpOptions
     public int LoungeVerifyTimeoutSeconds { get; set; } = 30;
 
     /// <summary>
-    /// How long to wait for the receiver's event stream to become ESTABLISHED before
-    /// any command is sent. Its own bound, separate from the verification budget:
-    /// the two failures are different and must be reported differently — a stream
-    /// that never opened means nothing was attempted, whereas an expired
-    /// verification budget means the command went out and was never confirmed.
+    /// How long to wait for the receiver's event stream to start BEING READ before
+    /// any command is sent. Readiness is a read outstanding on the stream, not
+    /// response headers coming back — the receiver announces a state change once, to
+    /// whoever is listening at that instant, so headers alone leave the announcement
+    /// with nowhere to land.
+    ///
+    /// Its own bound, separate from the verification budget: the two failures are
+    /// different and must be reported differently — a stream that never started
+    /// delivering means nothing was attempted, whereas an expired verification budget
+    /// means the command went out and was never confirmed.
     /// </summary>
     public int LoungeSubscribeTimeoutSeconds { get; set; } = 10;
 

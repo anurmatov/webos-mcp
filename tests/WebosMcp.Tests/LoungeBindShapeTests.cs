@@ -290,9 +290,9 @@ public sealed class LoungeBindShapeTests
         // sends its command next, and a silently dead stream would turn that into an
         // unverifiable command reported as never observed.
         var http = new CapturingLoungeHandler(
+            pollStatus: HttpStatusCode.Forbidden,
             (HttpStatusCode.OK, $$"""{"screens":[{"screenId":"{{ScreenId}}","loungeToken":"{{Token}}"}]}"""),
-            (HttpStatusCode.OK, BindResponse()),
-            (HttpStatusCode.Forbidden, string.Empty));
+            (HttpStatusCode.OK, BindResponse()));
 
         var client = new LoungeClient(
             new HttpClient(http),
