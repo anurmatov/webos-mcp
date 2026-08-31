@@ -108,7 +108,8 @@ public sealed class FileClientKeyStore : IClientKeyStore
                 Directory.CreateDirectory(directory);
             }
 
-            var json = JsonSerializer.Serialize(new StoredKey(clientKey.Trim()));
+            var json = JsonSerializer.Serialize(
+                new StoredKey(clientKey.Trim(), SsapManifest.PermissionsFingerprint));
             await File.WriteAllTextAsync(path, json, cancellationToken).ConfigureAwait(false);
             TryRestrictPermissions(path);
 
@@ -174,7 +175,8 @@ public sealed class FileClientKeyStore : IClientKeyStore
                     Directory.CreateDirectory(directory);
                 }
 
-                var json = JsonSerializer.Serialize(new StoredKey(trimmed));
+                var json = JsonSerializer.Serialize(
+                    new StoredKey(trimmed, SsapManifest.PermissionsFingerprint));
 
                 // Write to a sibling temp file, flush it to the device, then
                 // rename over the target. A crash mid-write therefore leaves
@@ -235,6 +237,60 @@ public sealed class FileClientKeyStore : IClientKeyStore
         }
     }
 
+    /// <summary>
+    /// Compares the permission set the stored key was granted under with the one
+    /// this build presents. Read-only in every sense: it never writes, never
+    /// clears the key, and never triggers pairing.
+    ///
+    /// An operator-supplied inline key or mounted secret carries no fingerprint
+    /// and is not ours to judge, so it is reported as not stale — guessing "stale"
+    /// there would nag on every denial for a pairing we cannot see the history of.
+    /// </summary>
+    public async Task<bool> IsGrantStaleAsync(CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrWhiteSpace(_options.ClientKey) || !string.IsNullOrWhiteSpace(_options.ClientKeyFile))
+        {
+            return false;
+        }
+
+        var path = _options.ResolvedClientKeyPath;
+
+        await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return false;
+            }
+
+            var contents = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
+            var stored = TryReadStored(contents);
+
+            if (stored is null || string.IsNullOrWhiteSpace(stored.ClientKey))
+            {
+                return false;
+            }
+
+            // A null fingerprint is a key from before this was recorded. It is
+            // exactly the case where a permission added since will be denied, so
+            // it counts as stale.
+            return !string.Equals(
+                stored.PermissionsFingerprint,
+                SsapManifest.PermissionsFingerprint,
+                StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Never echoes the file body — it holds the key.
+            _logger.LogDebug("Could not read the stored permission fingerprint: {Message}", ex.Message);
+            return false;
+        }
+        finally
+        {
+            _ioLock.Release();
+        }
+    }
+
     public string DescribeLocation()
     {
         if (!string.IsNullOrWhiteSpace(_options.ClientKey))
@@ -267,12 +323,16 @@ public sealed class FileClientKeyStore : IClientKeyStore
         }
     }
 
-    private static string? TryExtractFromJson(string contents)
+    private static string? TryExtractFromJson(string contents) => TryReadStored(contents) is { } stored &&
+        !string.IsNullOrWhiteSpace(stored.ClientKey)
+        ? stored.ClientKey
+        : null;
+
+    private static StoredKey? TryReadStored(string contents)
     {
         try
         {
-            var stored = JsonSerializer.Deserialize<StoredKey>(contents);
-            return string.IsNullOrWhiteSpace(stored?.ClientKey) ? null : stored!.ClientKey;
+            return JsonSerializer.Deserialize<StoredKey>(contents);
         }
         catch (JsonException)
         {
@@ -280,5 +340,15 @@ public sealed class FileClientKeyStore : IClientKeyStore
         }
     }
 
-    private sealed record StoredKey([property: JsonPropertyName("clientKey")] string ClientKey);
+    /// <summary>
+    /// The on-disk shape. <c>permissionsFingerprint</c> is optional: a key written
+    /// by an earlier version has none, and that absence is meaningful — it means
+    /// the grant predates permission-set tracking and may not cover permissions
+    /// added since.
+    /// </summary>
+    private sealed record StoredKey(
+        [property: JsonPropertyName("clientKey")] string ClientKey,
+        [property: JsonPropertyName("permissionsFingerprint")]
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        string? PermissionsFingerprint = null);
 }

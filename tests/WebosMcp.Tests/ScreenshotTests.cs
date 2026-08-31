@@ -120,9 +120,12 @@ public sealed class ScreenshotTests
     {
         // The mapping that turns the TV's own refusal into the honest-unsupported
         // code lives in the SSAP layer; this pins it for the capture wording too.
+        // Capture runs as an ordinary command, so the REQUEST-frame mapper is the
+        // one that applies — the registration-frame mapper reads the same wording
+        // differently, which is the point of them being separate.
         Assert.Equal(
             TvErrorCode.TvUnsupportedCapability,
-            SsapWebSocketConnection.MapSsapError(detail).Code);
+            SsapWebSocketConnection.MapRequestError(detail).Code);
     }
 
     // ------------------------------------------------- untrusted imageUri rules

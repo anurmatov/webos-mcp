@@ -26,7 +26,12 @@ public sealed class ActiveDeviceApplier : IHostedService
 
         if (active is not null)
         {
-            _logger.LogInformation("Active TV is the registered device {Id}.", active.Id);
+            // No identifier, address or name. The fact that a stored selection was
+            // applied is what an operator needs at startup; WHICH device it was is
+            // something they can ask for with tv_list_devices, and putting it in a
+            // log line writes a device identifier into every log sink for the life
+            // of the process to answer a question nobody asked.
+            _logger.LogInformation("Applied the stored active TV selection.");
         }
     }
 

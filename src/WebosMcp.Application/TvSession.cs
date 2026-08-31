@@ -45,6 +45,9 @@ public sealed class TvSession : ITvSession, IAsyncDisposable
 
     private ISsapConnection? _connection;
 
+    /// <summary>Keeps the stale-grant warning to once per process, not once per denied command.</summary>
+    private bool _staleGrantReported;
+
     public TvSession(
         ISsapConnectionFactory factory,
         IClientKeyStore keyStore,
@@ -127,6 +130,13 @@ public sealed class TvSession : ITvSession, IAsyncDisposable
                 await DisposeConnectionAsync().ConfigureAwait(false);
                 throw TvException.TimedOut(operation);
             }
+            catch (TvException ex) when (ex.Code == TvErrorCode.TvPermissionDenied)
+            {
+                // Denied for a capability the pairing never obtained. If the
+                // permission set has changed since this TV was paired, that is
+                // very likely why — say so, and name the explicit action.
+                throw await AnnotateStaleGrantAsync(ex, cancellationToken).ConfigureAwait(false);
+            }
             catch (TvException)
             {
                 throw;
@@ -141,6 +151,58 @@ public sealed class TvSession : ITvSession, IAsyncDisposable
         {
             _gate.Release();
         }
+    }
+
+    /// <summary>
+    /// Adds the re-pair hint to a denial when the stored grant predates the
+    /// current permission manifest.
+    ///
+    /// This is the ONLY thing done about a stale grant. Re-pairing needs a human
+    /// at the TV, so doing it automatically would either fail or condition someone
+    /// to approve prompts they did not ask for; and clearing a working key to
+    /// force the issue would break every command that the old grant still covers.
+    /// The honest move is to explain and let a person decide.
+    ///
+    /// The error code is preserved: only the message grows.
+    /// </summary>
+    private async Task<TvException> AnnotateStaleGrantAsync(
+        TvException denial,
+        CancellationToken cancellationToken)
+    {
+        bool stale;
+        try
+        {
+            stale = await _keyStore.IsGrantStaleAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A hint is never worth turning one failure into a different one.
+            _logger.LogDebug("Could not check the stored permission grant: {Message}", ex.Message);
+            return denial;
+        }
+
+        if (!stale)
+        {
+            return denial;
+        }
+
+        if (!_staleGrantReported)
+        {
+            _staleGrantReported = true;
+            _logger.LogWarning(
+                "This TV was paired under a different permission set than this build requests. Commands needing " +
+                "a permission added since will keep being denied until someone re-pairs explicitly. Nothing is " +
+                "re-paired automatically.");
+        }
+
+        return new TvException(
+            denial.Code,
+            denial.Message +
+            " This TV was paired under an earlier permission set, which is the most likely cause: a changed " +
+            "manifest does not widen an existing grant. To grant the added permissions, re-pair explicitly — " +
+            "run the 'webos-mcp pair' operator command, or call pair_device with force=true where it is enabled — " +
+            "and accept the prompt on the TV. Nothing re-pairs on its own.",
+            denial);
     }
 
     private async Task<ISsapConnection> EnsureConnectedAsync(string clientKey, CancellationToken cancellationToken)

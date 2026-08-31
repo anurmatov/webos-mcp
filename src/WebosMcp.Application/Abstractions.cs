@@ -72,6 +72,20 @@ public interface IClientKeyStore
     /// </summary>
     Task<string> PersistAsync(string clientKey, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// True when the stored key was granted under a DIFFERENT permission set than
+    /// the one this build presents — including a key stored before the permission
+    /// set was recorded at all, which is every key paired by an earlier version.
+    ///
+    /// This is reported, never acted on. A changed manifest does not retroactively
+    /// widen an existing grant, and the server must not re-pair to obtain the new
+    /// permissions: pairing requires a human at the TV, so a background re-pair
+    /// would either fail or, worse, train someone to approve prompts they did not
+    /// ask for. The one legitimate use is telling an operator WHY a command was
+    /// denied and what explicit action would fix it.
+    /// </summary>
+    Task<bool> IsGrantStaleAsync(CancellationToken cancellationToken);
+
     /// <summary>The configured durable writable path, or null when there is none.</summary>
     string? DurableWritablePath { get; }
 

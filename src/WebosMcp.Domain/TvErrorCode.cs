@@ -18,6 +18,17 @@ public enum TvErrorCode
     /// <summary>The TV is connected but does not support this capability on this input/model.</summary>
     TvUnsupportedCapability,
 
+    /// <summary>
+    /// The session is registered and healthy, but the TV refused THIS command
+    /// because the capability it needs was not granted to this pairing.
+    ///
+    /// Distinct from <see cref="PairingRequired"/> on purpose: the key is present
+    /// and working, and adjacent commands still succeed. Reporting a denied
+    /// command as a missing key sends an operator to re-pair a pairing that was
+    /// never broken, and hides the real cause.
+    /// </summary>
+    TvPermissionDenied,
+
     /// <summary>The request was rejected before touching the TV because an input failed validation.</summary>
     InvalidInput,
 
@@ -49,6 +60,7 @@ public static class TvErrorCodeExtensions
         TvErrorCode.TvOff => "TV_OFF",
         TvErrorCode.TvUnreachable => "TV_UNREACHABLE",
         TvErrorCode.TvUnsupportedCapability => "TV_UNSUPPORTED_CAPABILITY",
+        TvErrorCode.TvPermissionDenied => "TV_PERMISSION_DENIED",
         TvErrorCode.InvalidInput => "INVALID_INPUT",
         TvErrorCode.Timeout => "TIMEOUT",
         TvErrorCode.TvError => "TV_ERROR",
