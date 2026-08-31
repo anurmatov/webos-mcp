@@ -416,6 +416,41 @@ public sealed class YouTubeLoungeTests
     }
 
     [Fact]
+    public void Length_prefixes_are_UTF8_BYTE_counts_not_character_counts()
+    {
+        // The receiver prefixes each chunk with a byte count. Slicing by char index
+        // desynchronises the whole stream the moment an event carries non-ASCII —
+        // a Cyrillic video title is enough — and every later chunk is misread.
+        var payload = """[[1,["nowPlaying",{"videoId":"dQw4w9WgXcQ","state":"1","title":"Кыргызстан"}]]]""";
+        var byteCount = System.Text.Encoding.UTF8.GetByteCount(payload);
+
+        Assert.True(byteCount > payload.Length, "the fixture must actually be multi-byte");
+
+        var state = LoungeSession.ParseReceiverState(
+            Assert.Single(LoungeSession.ParseChunks($"{byteCount}\n{payload}")));
+
+        Assert.Equal("dQw4w9WgXcQ", state!.VideoId);
+        Assert.Equal(LoungePlayerState.Playing, state.State);
+    }
+
+    [Fact]
+    public void A_non_ascii_chunk_does_not_desynchronise_the_chunks_after_it()
+    {
+        // The real damage of a char-indexed scan: the FOLLOWING chunk is lost too.
+        var first = """[[1,["nowPlaying",{"videoId":"aBcDeFgHiJk","state":"2","title":"Кыргызстан"}]]]""";
+        var second = """[[2,["nowPlaying",{"videoId":"dQw4w9WgXcQ","state":"1"}]]]""";
+
+        var body =
+            $"{System.Text.Encoding.UTF8.GetByteCount(first)}\n{first}" +
+            $"{System.Text.Encoding.UTF8.GetByteCount(second)}\n{second}";
+
+        var chunks = LoungeSession.ParseChunks(body);
+
+        Assert.Equal(2, chunks.Count);
+        Assert.Equal("dQw4w9WgXcQ", LoungeSession.ParseReceiverState(chunks[1])!.VideoId);
+    }
+
+    [Fact]
     public void A_truncated_or_malformed_chunk_is_skipped_rather_than_throwing()
     {
         // The stream is a long poll; a partial trailing chunk is normal, not an error.

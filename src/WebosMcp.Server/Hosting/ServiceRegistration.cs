@@ -21,6 +21,13 @@ public static class ServiceRegistration
         services.AddSingleton<IWolSender, UdpWolSender>();
         services.AddSingleton<IClientKeyStore, FileClientKeyStore>();
         services.AddSingleton<ITvDiscovery, SsdpTvDiscovery>();
+        services.AddSingleton<IDeviceStore, FileDeviceStore>();
+        services.AddSingleton<INetworkFacts, SystemNetworkFacts>();
+        services.AddSingleton<DeviceService>();
+
+        // The active device is applied before anything reads Host/MAC, so a
+        // selection made through MCP survives a restart without an env var.
+        services.AddHostedService<ActiveDeviceApplier>();
         services.AddSingleton<ISsdpChannel, UdpSsdpChannel>();
 
         // DIAL is a third protocol alongside SSAP and WOL; it gets a plain

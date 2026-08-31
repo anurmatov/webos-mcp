@@ -29,6 +29,7 @@ control it and read back what is actually playing.
 - [Requirements](#requirements)
 - [Quick start — stdio](#quick-start--stdio)
 - [Quick start — HTTP and Docker](#quick-start--http-and-docker)
+- [Device setup without environment variables](#device-setup-without-environment-variables)
 - [Discovery and pairing](#discovery-and-pairing)
 - [Pairing over MCP (opt-in)](#pairing-over-mcp-opt-in)
 - [Configuration reference](#configuration-reference)
@@ -110,6 +111,11 @@ thing.
 
 > On stdio, stdout is the protocol channel. All logging goes to stderr.
 
+> The YouTube Lounge token travels as a URL query parameter, and `HttpClient`'s
+> built-in logging writes full request URIs. All three entry points therefore raise
+> the HTTP logging categories to `Warning`, so no live credential is printed.
+> Warnings and errors still surface — they carry no URI.
+
 ---
 
 ## Quick start — HTTP and Docker
@@ -136,6 +142,40 @@ silently serve unauthenticated, state-changing TV control to your network. See
 
 **The compose example uses `network_mode: host`.** That is the supported path
 for Wake-on-LAN over Docker — see the [WOL caveat](#wake-on-lan-in-bridge-mode).
+
+---
+
+## Device setup without environment variables
+
+You can point the server at a TV entirely through MCP — no `WEBOSMCP__HOST`,
+`MACADDRESS` or `BROADCASTADDRESS` needed:
+
+| Tool | What it does |
+|---|---|
+| `tv_discover_devices` | Scan the LAN. Returns candidates with MAC and broadcast address already derived where the network can supply them. Registers nothing. |
+| `tv_register_device` | Register an address and make it active. Derives MAC and broadcast; re-registering a known address updates it. |
+| `tv_list_devices` | Registered TVs and which is active. |
+| `tv_select_device` | Switch the active TV. Takes effect immediately, no restart. |
+| `tv_update_device` | Override a derived value — usually a MAC the network could not supply. |
+| `tv_remove_device` | Forget a TV. Removing the active one promotes another. |
+
+The device book is JSON at `~/.webos-mcp/devices.json` (override with
+`WEBOSMCP__DEVICESTOREPATH`; in a container point it at a writable volume). It
+holds **no secret** — the pairing key stays in its own file.
+
+**Explicit environment configuration always wins.** If you set `WEBOSMCP__HOST`,
+a stored device never overrides it. Silent precedence in the other direction is
+the kind of thing that costs an afternoon to debug.
+
+**One TV is active at a time and no tool takes a device argument.** This is device
+*setup*, not per-call routing — the single-TV design is unchanged.
+
+**Accepting the pairing prompt on the TV is still a human step**, deliberately. It
+is the boundary that stops anything pairing unattended.
+
+Where the MAC cannot be derived (the neighbour table has no entry, or the tool is
+absent in a minimal container), registration still succeeds and says so —
+`tv_power_on` is simply unavailable until you supply one with `tv_update_device`.
 
 ---
 
@@ -261,6 +301,7 @@ network normally cannot receive it. Step 4 is last for that reason.
 | `WEBOSMCP__LOUNGEBASEURL` | `https://www.youtube.com` | YouTube Lounge service. The one outbound-internet dependency. |
 | `WEBOSMCP__LOUNGEDEVICENAME` | `webos-mcp` | Name this remote presents to the receiver. |
 | `WEBOSMCP__LOUNGEVERIFYTIMEOUTSECONDS` | `30` | How long to wait for the receiver to confirm a command. |
+| `WEBOSMCP__DEVICESTOREPATH` | `~/.webos-mcp/devices.json` | Where registered devices are stored. Must be writable to register a TV. |
 
 To find the right value for a stubborn TV, run `M-SEARCH` from a host on the
 same LAN and read the `LOCATION` header of the reply; that host and port are
@@ -582,6 +623,9 @@ Specifically **not** claimed:
   or refuses the session, YouTube tools return `TV_UNSUPPORTED_CAPABILITY`.
 - That `observed: false` commands took effect. They were accepted; nothing more
   is claimed.
+- That a MAC address can always be derived. It comes from the OS neighbour table,
+  which a minimal container may not expose; registration succeeds without it and
+  `tv_power_on` stays unavailable until one is supplied.
 - That the built-in `WEBOSMCP__DIALPORTS` list covers every model. `2038` is
   what LG webOS was observed using, not a value from a specification. If your
   TV advertises DIAL somewhere else, set `WEBOSMCP__DIALAPPLICATIONURL` or add

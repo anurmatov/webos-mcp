@@ -21,6 +21,7 @@ public static class HttpServerHost
 
         builder.Logging.ClearProviders();
         builder.Logging.AddSimpleConsole(options => options.SingleLine = true);
+        builder.Logging.AddSecretSafeFilters();
 
         builder.Services.AddSingleton(settings);
         builder.Services.AddWebosMcp(builder.Configuration);

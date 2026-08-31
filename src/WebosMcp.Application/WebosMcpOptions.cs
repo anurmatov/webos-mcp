@@ -23,8 +23,23 @@ public sealed class WebosMcpOptions
     /// <summary>TV MAC address for Wake-on-LAN, e.g. 00:11:22:33:44:55.</summary>
     public string? MacAddress { get; set; }
 
+    public const string DefaultBroadcastAddress = "255.255.255.255";
+
     /// <summary>Broadcast address used for the WOL magic packet. Defaults to the all-subnets broadcast.</summary>
-    public string BroadcastAddress { get; set; } = "255.255.255.255";
+    public string BroadcastAddress { get; set; } = DefaultBroadcastAddress;
+
+    /// <summary>
+    /// Where the device book lives. Registration writes here, so in a container it
+    /// must be a writable volume — the same requirement as the client key.
+    /// </summary>
+    public string? DeviceStorePath { get; set; }
+
+    /// <summary>
+    /// True once <see cref="Host"/> was supplied by the device book rather than by
+    /// the operator. Explicit environment configuration always wins; this flag is
+    /// what stops a stored selection silently overriding it.
+    /// </summary>
+    public bool HostCameFromDeviceBook { get; set; }
 
     /// <summary>
     /// Explicit DIAL application URL, e.g. http://192.0.2.10:2038/apps/. When set,
@@ -166,6 +181,14 @@ public sealed class WebosMcpOptions
         }
     }
 
+    public string ResolvedDeviceStorePath =>
+        string.IsNullOrWhiteSpace(DeviceStorePath)
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".webos-mcp",
+                "devices.json")
+            : DeviceStorePath!;
+
     public string ResolvedClientKeyPath =>
         string.IsNullOrWhiteSpace(ClientKeyPath)
             ? Path.Combine(
@@ -216,7 +239,7 @@ public sealed class WebosMcpOptions
         }
     }
 
-    internal static PhysicalAddress ParseMac(string mac)
+    public static PhysicalAddress ParseMac(string mac)
     {
         var normalised = mac.Replace(":", "", StringComparison.Ordinal)
             .Replace("-", "", StringComparison.Ordinal)

@@ -382,32 +382,36 @@ internal sealed class LoungeSession : ILoungeSession
     /// </summary>
     internal static IReadOnlyList<JsonElement> ParseChunks(string body)
     {
+        // The length prefix is a BYTE count, not a character count. Decoding to a
+        // string first and slicing by char index silently desynchronises the whole
+        // stream the moment an event carries a non-ASCII character — a video title
+        // in Cyrillic is enough — and every later chunk is then misread. So the
+        // scan runs over UTF-8 bytes and only the payload is decoded.
+        var bytes = Encoding.UTF8.GetBytes(body);
         var events = new List<JsonElement>();
         var index = 0;
 
-        while (index < body.Length)
+        while (index < bytes.Length)
         {
-            var newline = body.IndexOf('\n', index);
+            var newline = Array.IndexOf(bytes, (byte)'\n', index);
             if (newline < 0)
             {
                 break;
             }
 
-            if (!int.TryParse(
-                    body.AsSpan(index, newline - index).Trim(),
-                    NumberStyles.Integer,
-                    CultureInfo.InvariantCulture,
-                    out var length))
+            var header = Encoding.ASCII.GetString(bytes, index, newline - index).Trim();
+
+            if (!int.TryParse(header, NumberStyles.Integer, CultureInfo.InvariantCulture, out var length))
             {
                 break;
             }
 
             var start = newline + 1;
 
-            // Lengths are byte counts; clamp so a mismatch truncates rather than throws.
-            var available = body.Length - start;
+            // Clamp so a truncated trailing chunk stops the scan instead of throwing.
+            var available = bytes.Length - start;
             var take = Math.Min(Math.Max(length, 0), available);
-            var json = body.Substring(start, take);
+            var json = Encoding.UTF8.GetString(bytes, start, take);
 
             index = start + take;
 

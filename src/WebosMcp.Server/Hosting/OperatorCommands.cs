@@ -21,6 +21,7 @@ public static class OperatorCommands
         var builder = Host.CreateApplicationBuilder(args);
         builder.Logging.ClearProviders();
         builder.Logging.AddSimpleConsole(options => options.SingleLine = true);
+        builder.Logging.AddSecretSafeFilters();
         builder.Logging.Services.Configure<ConsoleLoggerOptions>(
             options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 

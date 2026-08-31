@@ -31,7 +31,10 @@ public sealed partial class DialClient : IDialClient, IDisposable
     private readonly ILogger<DialClient> _logger;
 
     // The application URL rarely changes, and rediscovery costs an SSDP round.
+    // Cached against the host it was resolved for: selecting a different device must
+    // not keep serving the previous TV's endpoint.
     private Uri? _cachedApplicationUrl;
+    private string? _cachedForHost;
 
     public DialClient(
         HttpClient http,
@@ -50,6 +53,12 @@ public sealed partial class DialClient : IDialClient, IDisposable
 
     public async Task<Uri?> ResolveApplicationUrlAsync(CancellationToken cancellationToken)
     {
+        if (!string.Equals(_cachedForHost, _options.Host, StringComparison.OrdinalIgnoreCase))
+        {
+            _cachedApplicationUrl = null;
+            _cachedForHost = _options.Host;
+        }
+
         if (_cachedApplicationUrl is not null)
         {
             return _cachedApplicationUrl;

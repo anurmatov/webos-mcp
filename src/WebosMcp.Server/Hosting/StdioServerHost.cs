@@ -15,6 +15,7 @@ public static class StdioServerHost
         // or the transport is corrupted.
         builder.Logging.ClearProviders();
         builder.Logging.AddSimpleConsole(options => options.SingleLine = true);
+        builder.Logging.AddSecretSafeFilters();
         builder.Logging.Services.Configure<ConsoleLoggerOptions>(
             options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 
