@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -10,13 +11,33 @@ namespace WebosMcp.Application;
 /// report the playing video, so this is false on every DIAL path — the caller is
 /// told plainly rather than left to read success as a read-back confirmation.
 /// </param>
-/// <param name="ColdStarted">Whether a running app had to be stopped and restarted for the request to take effect.</param>
+/// <summary>
+/// The outcome of one YouTube receiver command.
+/// </summary>
+/// <param name="Observed">
+/// Whether the receiver actually confirmed the effect. False means the command was
+/// ACCEPTED ONLY — the receiver announces no event for it — and must not be read as
+/// the action having happened.
+/// </param>
+public sealed record YouTubeControlResult(
+    string Command,
+    bool Observed,
+    string? ObservedVideoId = null,
+    string? ObservedState = null,
+    double? ObservedCurrentTime = null,
+    int? ObservedVolume = null,
+    bool? ObservedAutoplayEnabled = null,
+    string Detail = "");
+
+/// <param name="ObservedVideoId">The video id the receiver itself reported, when it reported one.</param>
+/// <param name="ObservedState">The player state the receiver itself reported, when it reported one.</param>
 public sealed record ContentActionResult(
     ActionPath Path,
     string Detail,
     string? AppId = null,
     bool ExactVideoConfirmed = false,
-    bool ColdStarted = false);
+    string? ObservedVideoId = null,
+    string? ObservedState = null);
 
 /// <summary>
 /// The shared capability layer. Both transports (stdio and Streamable HTTP)
@@ -43,6 +64,7 @@ public sealed class TvControlService
     private readonly ITvSession _session;
     private readonly IDelayProvider _delay;
     private readonly IDialClient _dial;
+    private readonly ILoungeClient _lounge;
     private readonly WebosMcpOptions _options;
     private readonly ILogger<TvControlService> _logger;
 
@@ -50,12 +72,14 @@ public sealed class TvControlService
         ITvSession session,
         IDelayProvider delay,
         IDialClient dial,
+        ILoungeClient lounge,
         IOptions<WebosMcpOptions> options,
         ILogger<TvControlService> logger)
     {
         _session = session;
         _delay = delay;
         _dial = dial;
+        _lounge = lounge;
         _options = options.Value;
         _logger = logger;
     }
@@ -350,123 +374,331 @@ public sealed class TvControlService
             throw TvException.Unsupported("the YouTube DIAL application (it is not installed on this TV)");
         }
 
-        // A DIAL launch aimed at an ALREADY-RUNNING app does not change what it is
-        // playing: the TV accepts the request, the app stays foreground, and the
-        // previous video keeps going. Physical testing hit exactly this, and because
-        // the only check was "is YouTube in the foreground" — already true — it was
-        // reported as success. Foreground identity is not evidence of the video.
+        // DIAL is used ONLY to find the receiver. It cannot select a video in a
+        // running YouTube session (the launch is accepted and ignored) and it cannot
+        // report which video is playing, which is how earlier revisions reported
+        // success over the wrong video. Lounge does both.
         //
-        // The only way DIAL can make a specific video take effect is a cold start,
-        // so a running instance is stopped first. Where that is not possible, the
-        // honest answer is that this TV cannot do it — never a launch dressed up as
-        // playback.
-        var restarted = false;
-
-        if (status.IsRunning)
+        // Cold-restarting YouTube to force the video is deliberately NOT done: on the
+        // physical TV that lands on the account/profile picker, which is worse than
+        // the bug it would work around.
+        if (!status.IsRunning)
         {
-            if (!status.CanStop)
-            {
-                throw new TvException(
-                    TvErrorCode.TvUnsupportedCapability,
-                    $"YouTube is already running and this TV does not allow DIAL to stop it " +
-                    $"(allowStop={status.AllowStop.ToString().ToLowerInvariant()}, " +
-                    $"instance link {(status.RunLink is null ? "absent" : "present")}). " +
-                    $"A DIAL launch cannot change the video of a running session, so '{videoId}' cannot " +
-                    "be made to play. Stop YouTube on the TV and try again.");
-            }
-
-            if (!await _dial.StopAppAsync(applicationUrl, DialYouTubeApp, status.RunLink!, ct).ConfigureAwait(false))
-            {
-                throw new TvException(
-                    TvErrorCode.TvUnsupportedCapability,
-                    $"YouTube is already running and the TV refused the DIAL stop, so '{videoId}' cannot " +
-                    "be made to replace what is currently playing.");
-            }
-
-            if (!await WaitUntilStoppedAsync(applicationUrl, ct).ConfigureAwait(false))
-            {
-                throw new TvException(
-                    TvErrorCode.TvUnsupportedCapability,
-                    $"The DIAL stop for YouTube was accepted but the app was still running after " +
-                    $"{_options.LaunchVerifyTimeoutSeconds}s, so a cold start with '{videoId}' could not " +
-                    "be performed. Reporting failure rather than launching over the old session.");
-            }
-
-            restarted = true;
+            // Nothing to control yet, so start the receiver. This is a launch of a
+            // stopped app, not a restart to select a video.
+            await _dial.LaunchAppAsync(applicationUrl, DialYouTubeApp, string.Empty, ct).ConfigureAwait(false);
+            status = await WaitForReceiverAsync(applicationUrl, ct).ConfigureAwait(false);
         }
 
-        var accepted = await _dial.LaunchAppAsync(
-            applicationUrl, DialYouTubeApp, $"v={Uri.EscapeDataString(videoId)}", ct).ConfigureAwait(false);
-
-        if (!accepted)
+        if (status?.ScreenId is not { Length: > 0 } screenId)
         {
             throw new TvException(
-                TvErrorCode.TvError,
-                $"The TV rejected the DIAL launch request for video '{videoId}'.");
+                TvErrorCode.TvUnsupportedCapability,
+                "The YouTube receiver on this TV advertises no screen id, so it cannot be remote-controlled " +
+                "and the requested video cannot be loaded or verified. Reporting unsupported rather than " +
+                "launching something unverifiable.");
         }
 
-        // Acceptance is not evidence. Confirm from the TV's own foreground-app
-        // report before calling this a success.
-        var evidence = await ConfirmForegroundAsync(
-            YouTubeAppIdFragment,
-            dialEndpointFound: true,
-            dialLaunchAccepted: true,
-            started,
+        await using var session = await ConnectLoungeAsync(screenId, ct).ConfigureAwait(false);
+
+        await session.SendAsync(
+            "setPlaylist",
+            new Dictionary<string, string>
+            {
+                ["videoId"] = videoId,
+                ["currentIndex"] = "0",
+                ["currentTime"] = "0",
+                ["audioOnly"] = "false",
+                ["listId"] = string.Empty,
+            },
             ct).ConfigureAwait(false);
 
-        if (!evidence.ForegroundConfirmed)
+        // Acceptance is still not playback. Wait for the RECEIVER to report this
+        // video id in a playing state — the first read-back this tool has ever had.
+        var observed = await ObserveAsync(
+            session,
+            state => string.Equals(state.VideoId, videoId, StringComparison.Ordinal)
+                     && state.State is LoungePlayerState.Playing,
+            ct).ConfigureAwait(false);
+
+        if (observed is null)
         {
             throw new TvException(
                 TvErrorCode.TvError,
-                $"The DIAL launch for video '{videoId}' was accepted, but YouTube did not reach the " +
-                $"foreground within {_options.LaunchVerifyTimeoutSeconds}s " +
-                $"(foreground app was '{evidence.ForegroundAppId ?? "unknown"}'). " +
-                "Reporting failure rather than an unverified success.");
+                $"The receiver accepted the request for video '{videoId}' but never reported it playing " +
+                $"within {_options.LoungeVerifyTimeoutSeconds}s. Reporting failure rather than an " +
+                "unverified success.");
         }
 
-        // What was actually observed: YouTube was cold-started and reached the
-        // foreground carrying this video id as its launch payload. What was NOT
-        // observed: the video now on screen. DIAL exposes no way to read back the
-        // playing video, so exactness is stated as unconfirmed rather than implied
-        // by a bare "success".
-        var how = restarted
-            ? "Stopped the running YouTube session, relaunched it cold"
-            : "Launched YouTube";
-
         return new ContentActionResult(
-            ActionPath.Dial,
-            $"{how} with video '{videoId}' over DIAL and confirmed YouTube reached the foreground " +
-            $"(app '{evidence.ForegroundAppId}') after {evidence.ElapsedSeconds:0.0}s. " +
-            "The video id was delivered to a freshly started app, which is what makes it take effect; " +
-            "DIAL cannot report which video is on screen, so this is not a read-back confirmation.",
-            evidence.ForegroundAppId,
-            ExactVideoConfirmed: false,
-            ColdStarted: restarted);
+            ActionPath.Lounge,
+            $"Loaded video '{videoId}' into the running YouTube receiver and observed it reported back as " +
+            $"playing after {Elapsed(started):0.0}s.",
+            AppId: null,
+            ExactVideoConfirmed: true,
+            ObservedVideoId: observed.VideoId,
+            ObservedState: observed.State.ToString());
     }
 
     /// <summary>
-    /// Polls DIAL until the app reports a non-running state. Bounded by the same
-    /// budget as launch verification.
+    /// Opens a Lounge session, or reports the receiver as uncontrollable. Every
+    /// YouTube control tool goes through here.
     /// </summary>
-    private async Task<bool> WaitUntilStoppedAsync(Uri applicationUrl, CancellationToken ct)
+    private async Task<ILoungeSession> ConnectLoungeAsync(string screenId, CancellationToken ct)
+    {
+        var session = await _lounge.ConnectAsync(screenId, ct).ConfigureAwait(false);
+
+        return session ?? throw new TvException(
+            TvErrorCode.TvUnsupportedCapability,
+            "The YouTube receiver did not accept a remote-control session, so the requested video cannot " +
+            "be loaded or verified on this TV.");
+    }
+
+    /// <summary>
+    /// Consumes receiver state reports until one satisfies <paramref name="predicate"/>
+    /// or the budget expires. Null means nothing matching was ever observed — which
+    /// callers report as failure, never as an assumed success.
+    /// </summary>
+    private async Task<LoungeReceiverState?> ObserveAsync(
+        ILoungeSession session,
+        Func<LoungeReceiverState, bool> predicate,
+        CancellationToken ct)
+    {
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        budget.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, _options.LoungeVerifyTimeoutSeconds)));
+
+        try
+        {
+            await foreach (var state in session.ObserveAsync(budget.Token).ConfigureAwait(false))
+            {
+                if (predicate(state))
+                {
+                    return state;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Budget expired without a matching report.
+        }
+
+        return null;
+    }
+
+    // ------------------------------------------------- youtube receiver control
+    //
+    // Every command below is sent over Lounge and then judged on what the RECEIVER
+    // reports back. Where the receiver announces no confirming event, the result
+    // says the command was accepted and NOT observed, rather than dressing
+    // acceptance up as success — the distinction this project keeps getting wrong
+    // when it is left implicit.
+
+    public Task<YouTubeControlResult> YouTubePauseAsync(CancellationToken ct) =>
+        ControlAsync("pause", null, s => s.State is LoungePlayerState.Paused, ct);
+
+    public Task<YouTubeControlResult> YouTubeResumeAsync(CancellationToken ct) =>
+        ControlAsync("play", null, s => s.State is LoungePlayerState.Playing, ct);
+
+    public Task<YouTubeControlResult> YouTubeNextAsync(CancellationToken ct) =>
+        ControlAsync("next", null, s => s.VideoId is { Length: > 0 }, ct);
+
+    public Task<YouTubeControlResult> YouTubePreviousAsync(CancellationToken ct) =>
+        ControlAsync("previous", null, s => s.VideoId is { Length: > 0 }, ct);
+
+    public Task<YouTubeControlResult> YouTubeSeekAsync(double seconds, CancellationToken ct)
+    {
+        if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds < 0)
+        {
+            throw TvException.Invalid($"Seek position must be a non-negative number of seconds, not '{seconds}'.");
+        }
+
+        return ControlAsync(
+            "seekTo",
+            new Dictionary<string, string> { ["newTime"] = seconds.ToString("0.###", CultureInfo.InvariantCulture) },
+            s => s.CurrentTime is not null,
+            ct);
+    }
+
+    public Task<YouTubeControlResult> YouTubeSetVolumeAsync(int volume, CancellationToken ct)
+    {
+        if (volume is < 0 or > 100)
+        {
+            throw TvException.Invalid($"Receiver volume must be between 0 and 100, not {volume}.");
+        }
+
+        return ControlAsync(
+            "setVolume",
+            new Dictionary<string, string> { ["volume"] = volume.ToString(CultureInfo.InvariantCulture) },
+            s => s.Volume is not null,
+            ct);
+    }
+
+    public Task<YouTubeControlResult> YouTubeSetAutoplayAsync(bool enabled, CancellationToken ct) =>
+        ControlAsync(
+            "setAutoplayMode",
+            new Dictionary<string, string> { ["autoplayMode"] = enabled ? "ENABLED" : "DISABLED" },
+            s => s.AutoplayEnabled == enabled,
+            ct);
+
+    public Task<YouTubeControlResult> YouTubeQueueAddAsync(string videoOrUrl, CancellationToken ct)
+    {
+        // setPlaylist with comma-separated ids did not build a reliable queue on the
+        // physical receiver; sequential addVideo did. Do not "optimise" this into a
+        // batched setPlaylist.
+        var videoId = InputValidation.ValidateYouTubeVideoId(videoOrUrl);
+
+        return ControlAsync(
+            "addVideo",
+            new Dictionary<string, string> { ["videoId"] = videoId },
+            observed: null,
+            ct);
+    }
+
+    /// <summary>
+    /// Playback speed is sent and accepted, but this receiver announces no speed
+    /// event, so there is nothing to observe. Reported as accepted-not-observed
+    /// rather than as success.
+    /// </summary>
+    public Task<YouTubeControlResult> YouTubeSetPlaybackSpeedAsync(double speed, CancellationToken ct)
+    {
+        if (speed is < 0.25 or > 2.0)
+        {
+            throw TvException.Invalid($"Playback speed must be between 0.25 and 2.0, not {speed}.");
+        }
+
+        return ControlAsync(
+            "setPlaybackSpeed",
+            new Dictionary<string, string>
+            {
+                ["playbackSpeed"] = speed.ToString("0.###", CultureInfo.InvariantCulture),
+            },
+            observed: null,
+            ct);
+    }
+
+    /// <summary>Reads the receiver's own current report. Pure observation, no command.</summary>
+    public async Task<YouTubeControlResult> YouTubeNowPlayingAsync(CancellationToken ct)
+    {
+        await using var session = await OpenReceiverAsync(ct).ConfigureAwait(false);
+
+        await session.SendAsync("getNowPlaying", null, ct).ConfigureAwait(false);
+
+        var state = await ObserveAsync(session, s => s.VideoId is { Length: > 0 }, ct).ConfigureAwait(false);
+
+        return state is null
+            ? new YouTubeControlResult(
+                "getNowPlaying",
+                Observed: false,
+                Detail: "The receiver reported nothing within the wait window, so there is no state to report.")
+            : Describe("getNowPlaying", state, observed: true);
+    }
+
+    /// <summary>
+    /// Sends one Lounge command and judges it on the receiver's own report.
+    /// A null <paramref name="observed"/> means the receiver announces no confirming
+    /// event for this command, so the result is explicitly accepted-not-observed.
+    /// </summary>
+    private async Task<YouTubeControlResult> ControlAsync(
+        string command,
+        IReadOnlyDictionary<string, string>? parameters,
+        Func<LoungeReceiverState, bool>? observed,
+        CancellationToken ct)
+    {
+        await using var session = await OpenReceiverAsync(ct).ConfigureAwait(false);
+
+        await session.SendAsync(command, parameters, ct).ConfigureAwait(false);
+
+        if (observed is null)
+        {
+            return new YouTubeControlResult(
+                command,
+                Observed: false,
+                Detail: $"The receiver accepted '{command}'. It announces no event confirming this command, " +
+                        "so the effect was NOT observed and is not being reported as verified.");
+        }
+
+        var state = await ObserveAsync(session, observed, ct).ConfigureAwait(false);
+
+        if (state is null)
+        {
+            throw new TvException(
+                TvErrorCode.TvError,
+                $"The receiver accepted '{command}' but never reported the expected change within " +
+                $"{_options.LoungeVerifyTimeoutSeconds}s. Reporting failure rather than an unverified success.");
+        }
+
+        return Describe(command, state, observed: true);
+    }
+
+    private static YouTubeControlResult Describe(string command, LoungeReceiverState state, bool observed) =>
+        new(command,
+            observed,
+            state.VideoId,
+            state.State == LoungePlayerState.Unknown ? null : state.State.ToString(),
+            state.CurrentTime,
+            state.Volume,
+            state.AutoplayEnabled,
+            $"The receiver confirmed '{command}' by reporting back its own state.");
+
+    /// <summary>
+    /// Opens a Lounge session against the RUNNING receiver. Deliberately does not
+    /// launch or restart YouTube: these are control commands for a session that is
+    /// already playing, and restarting would drop the TV on the profile picker.
+    /// </summary>
+    private async Task<ILoungeSession> OpenReceiverAsync(CancellationToken ct)
+    {
+        var applicationUrl = await _dial.ResolveApplicationUrlAsync(ct).ConfigureAwait(false)
+            ?? throw new TvException(
+                TvErrorCode.TvUnsupportedCapability,
+                "This TV exposes no DIAL endpoint, so the YouTube receiver cannot be found or controlled.");
+
+        var status = await _dial.GetAppStatusAsync(applicationUrl, DialYouTubeApp, ct).ConfigureAwait(false);
+
+        if (status is null || !status.Installed)
+        {
+            throw TvException.Unsupported("the YouTube DIAL application (it is not installed on this TV)");
+        }
+
+        if (!status.IsRunning)
+        {
+            throw new TvException(
+                TvErrorCode.TvUnsupportedCapability,
+                "YouTube is not running on the TV, so there is no receiver session to control. " +
+                "Start playback with tv_youtube_play first.");
+        }
+
+        if (status.ScreenId is not { Length: > 0 } screenId)
+        {
+            throw new TvException(
+                TvErrorCode.TvUnsupportedCapability,
+                "The YouTube receiver advertises no screen id, so it cannot be remote-controlled.");
+        }
+
+        return await ConnectLoungeAsync(screenId, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Polls DIAL until the receiver reports itself running, so a screen id exists.</summary>
+    private async Task<DialAppStatus?> WaitForReceiverAsync(Uri applicationUrl, CancellationToken ct)
     {
         var interval = TimeSpan.FromSeconds(Math.Max(1, _options.LaunchPollIntervalSeconds));
-        var budget = TimeSpan.FromSeconds(Math.Max(1, _options.LaunchVerifyTimeoutSeconds));
-        var maxAttempts = (int)Math.Ceiling(budget.TotalSeconds / interval.TotalSeconds);
+        var maxAttempts = (int)Math.Ceiling(
+            Math.Max(1, _options.LaunchVerifyTimeoutSeconds) / interval.TotalSeconds);
+
+        DialAppStatus? status = null;
 
         for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
-            var status = await _dial.GetAppStatusAsync(applicationUrl, DialYouTubeApp, ct).ConfigureAwait(false);
+            status = await _dial.GetAppStatusAsync(applicationUrl, DialYouTubeApp, ct).ConfigureAwait(false);
 
-            if (status is null || !status.IsRunning)
+            if (status is { IsRunning: true, ScreenId: { Length: > 0 } })
             {
-                return true;
+                return status;
             }
 
             await _delay.DelayAsync(interval, ct).ConfigureAwait(false);
         }
 
-        return false;
+        return status;
     }
 
     /// <summary>

@@ -30,6 +30,15 @@ public static class ServiceRegistration
             client.Timeout = TimeSpan.FromSeconds(10);
             client.DefaultRequestHeaders.UserAgent.ParseAdd("webos-mcp/1.0");
         });
+        // Lounge is the ONE component that leaves the LAN: controlling a running
+        // YouTube receiver requires Google's service. Timeout is generous because
+        // the event channel is a long poll.
+        services.AddHttpClient<ILoungeClient, LoungeClient>(client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(60);
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("webos-mcp/1.0");
+        });
+
         services.AddSingleton<IDelayProvider, RealDelayProvider>();
 
         services.AddSingleton<ITvSession, TvSession>();

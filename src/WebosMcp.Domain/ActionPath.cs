@@ -15,4 +15,11 @@ public enum ActionPath
     /// confirmed by observing the app actually reach the foreground.
     /// </summary>
     Dial,
+
+    /// <summary>
+    /// The YouTube Lounge protocol was used to control the running receiver, and
+    /// the receiver itself reported back the video id and player state. This is the
+    /// only path that can confirm WHICH video is playing.
+    /// </summary>
+    Lounge,
 }

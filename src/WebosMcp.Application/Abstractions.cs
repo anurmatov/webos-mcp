@@ -82,26 +82,20 @@ public interface IClientKeyStore
 public sealed record DiscoveredTv(string Address, string? FriendlyName, string? ModelName);
 
 /// <summary>State of a DIAL application on the TV.</summary>
-/// <param name="AllowStop">
-/// The app's DIAL <c>allowStop</c> option. Without it the app cannot be stopped
-/// over DIAL, and therefore cannot be cold-started with a new video.
-/// </param>
-/// <param name="RunLink">
-/// The <c>rel="run"</c> href of a running instance, relative to the app URL. This
-/// is the only address a DIAL stop can be sent to.
+/// <param name="ScreenId">
+/// The receiver's Lounge screen id, from the status document's
+/// <c>additionalData</c>. This is what DIAL is actually for here: it is the handle
+/// used to obtain a Lounge token and control the running YouTube receiver. Absent
+/// means the receiver cannot be controlled.
 /// </param>
 public sealed record DialAppStatus(
     string Name,
     string State,
     bool Installed,
-    bool AllowStop = false,
-    string? RunLink = null)
+    string? ScreenId = null)
 {
     public bool IsRunning => State.Equals("running", StringComparison.OrdinalIgnoreCase)
         || State.Equals("starting", StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>Whether a running instance can be stopped, which is what makes a cold restart possible.</summary>
-    public bool CanStop => AllowStop && !string.IsNullOrWhiteSpace(RunLink);
 }
 
 /// <summary>
@@ -140,17 +134,65 @@ public interface IDialClient
         string payload,
         CancellationToken cancellationToken);
 
-    /// <summary>
-    /// DELETEs a running app instance. Returns true when the TV accepted the stop.
-    /// Needed because launching over an already-running app does NOT change what it
-    /// is playing — the payload is ignored — so the only way to make a requested
-    /// video take effect is to stop the app and start it cold.
-    /// </summary>
-    Task<bool> StopAppAsync(
-        Uri applicationUrl,
-        string app,
-        string runLink,
+}
+
+/// <summary>
+/// One state report from the receiver — now-playing, plus the volume and autoplay
+/// changes it also announces. Every field is optional because a report only carries
+/// what changed, and a field the receiver did not send is left null rather than
+/// guessed at.
+/// </summary>
+public sealed record LoungeReceiverState(
+    string? VideoId = null,
+    LoungePlayerState State = LoungePlayerState.Unknown,
+    double? CurrentTime = null,
+    double? Duration = null,
+    int? Volume = null,
+    bool? AutoplayEnabled = null);
+
+/// <summary>YouTube receiver player states, as the Lounge protocol reports them.</summary>
+public enum LoungePlayerState
+{
+    Unknown = -2,
+    Unstarted = -1,
+    Ended = 0,
+    Playing = 1,
+    Paused = 2,
+    Buffering = 3,
+    Cued = 5,
+}
+
+/// <summary>
+/// A connected remote-control session against one YouTube receiver.
+///
+/// This is the only mechanism that can load a specific video into an ALREADY
+/// RUNNING receiver, and the only one that reports back which video is actually
+/// playing. DIAL can do neither: a DIAL launch aimed at a running app is accepted
+/// and ignored, and DIAL exposes no read-back of the playing video.
+/// </summary>
+public interface ILoungeSession : IAsyncDisposable
+{
+    /// <summary>Sends one Lounge command. Acceptance is NOT playback — callers must observe.</summary>
+    Task SendAsync(
+        string command,
+        IReadOnlyDictionary<string, string>? parameters,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The receiver's own state reports, as they arrive. This is the observation
+    /// every YouTube tool's success is proven against.
+    /// </summary>
+    IAsyncEnumerable<LoungeReceiverState> ObserveAsync(CancellationToken cancellationToken);
+}
+
+public interface ILoungeClient
+{
+    /// <summary>
+    /// Connects as a remote to the receiver with this screen id. Null when the
+    /// receiver cannot be controlled, which callers report as unsupported rather
+    /// than falling back to something unverifiable.
+    /// </summary>
+    Task<ILoungeSession?> ConnectAsync(string screenId, CancellationToken cancellationToken);
 }
 
 public interface ITvDiscovery

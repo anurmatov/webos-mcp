@@ -43,55 +43,37 @@ public sealed class ContentPathTests
     }
 
     // -------------------------------------------------------- youtube play
+    //
+    // Play now runs over Lounge. DIAL only supplies the receiver's screen id: it
+    // cannot select a video in a running session and cannot report which video is
+    // playing, which is how three earlier revisions reported success over the wrong
+    // video. Full Lounge coverage lives in YouTubeLoungeTests.
 
     [Fact]
-    public async Task Play_launches_over_dial_and_confirms_the_app_reached_the_foreground()
+    public async Task Play_loads_the_video_over_lounge_and_confirms_the_receiver_reported_it()
     {
-        var connection = new FakeSsapConnection();
-        ForegroundIsYouTube(connection);
-        var harness = new TestHarness(connection);
+        var harness = new TestHarness();
+        harness.Lounge.Session!.Reports.Add(new LoungeReceiverState("dQw4w9WgXcQ", LoungePlayerState.Playing));
 
         var result = await harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None);
 
-        Assert.Equal(ActionPath.Dial, result.Path);
-        Assert.Equal(1, harness.Dial.LaunchCount);
-        Assert.Equal(["v=dQw4w9WgXcQ"], harness.Dial.LaunchPayloads);
-
-        // The success message names the evidence, not just the request.
-        Assert.Contains("confirmed", result.Detail, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("foreground", result.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(ActionPath.Lounge, result.Path);
+        Assert.True(result.ExactVideoConfirmed);
+        Assert.Equal("dQw4w9WgXcQ", result.ObservedVideoId);
     }
 
     [Fact]
-    public async Task Play_accepts_a_full_url_and_launches_the_bare_video_id()
+    public async Task Play_accepts_a_full_url_and_sends_the_bare_video_id()
     {
-        var connection = new FakeSsapConnection();
-        ForegroundIsYouTube(connection);
-        var harness = new TestHarness(connection);
+        var harness = new TestHarness();
+        harness.Lounge.Session!.Reports.Add(new LoungeReceiverState("dQw4w9WgXcQ", LoungePlayerState.Playing));
 
         await harness.Control.PlayYouTubeAsync(
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ", CancellationToken.None);
 
-        Assert.Equal(["v=dQw4w9WgXcQ"], harness.Dial.LaunchPayloads);
-    }
-
-    [Fact]
-    public async Task Play_NEVER_reports_success_when_the_tv_stays_on_home()
-    {
-        // The exact defect physical testing found: DIAL accepts the launch,
-        // the TV does not switch app, and the old code called that success.
-        var connection = new FakeSsapConnection();
-        ForegroundIsHome(connection);
-        var harness = new TestHarness(connection);
-
-        var ex = await Assert.ThrowsAsync<TvException>(
-            () => harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None));
-
-        Assert.Equal(TvErrorCode.TvError, ex.Code);
-        Assert.Contains("did not reach the foreground", ex.Message, StringComparison.OrdinalIgnoreCase);
-
-        // It really did try — this is a verification failure, not a skipped launch.
-        Assert.Equal(1, harness.Dial.LaunchCount);
+        var sent = Assert.Single(harness.Lounge.Session.Sent);
+        Assert.Equal("setPlaylist", sent.Command);
+        Assert.Equal("dQw4w9WgXcQ", sent.Parameters["videoId"]);
     }
 
     [Fact]
@@ -134,36 +116,19 @@ public sealed class ContentPathTests
     }
 
     [Fact]
-    public async Task Play_reports_failure_when_the_tv_rejects_the_dial_launch()
-    {
-        var harness = new TestHarness();
-        harness.Dial.LaunchAccepted = false;
-
-        var ex = await Assert.ThrowsAsync<TvException>(
-            () => harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None));
-
-        Assert.Equal(TvErrorCode.TvError, ex.Code);
-        Assert.Contains("rejected", ex.Message, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [Fact]
     public async Task Play_does_not_use_the_ssap_launcher_at_all()
     {
-        var connection = new FakeSsapConnection();
-        ForegroundIsYouTube(connection);
-        var harness = new TestHarness(connection);
+        var harness = new TestHarness();
+        harness.Lounge.Session!.Reports.Add(new LoungeReceiverState("dQw4w9WgXcQ", LoungePlayerState.Playing));
 
         await harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None);
 
-        // The SSAP launcher is what produced the false success; the only SSAP
-        // traffic here should be the foreground-app confirmation.
+        // The SSAP launcher is what produced the first false success.
         Assert.DoesNotContain("ssap://system.launcher/launch", harness.Connection.RequestUris);
-        Assert.Contains(
-            "ssap://com.webos.applicationManager/getForegroundAppInfo", harness.Connection.RequestUris);
     }
 
     [Fact]
-    public async Task Play_rejects_a_malformed_video_reference_before_touching_dial()
+    public async Task Play_rejects_a_malformed_video_reference_before_touching_the_tv()
     {
         // Note: a bare 11-character string is a VALID id by shape, hyphens and
         // all — so an invalid case has to be something the pattern really
@@ -175,24 +140,6 @@ public sealed class ContentPathTests
 
         Assert.Equal(TvErrorCode.InvalidInput, ex.Code);
         Assert.Equal(0, harness.Dial.ResolveCount);
-    }
-
-    [Fact]
-    public async Task Foreground_confirmation_is_bounded_and_does_not_spin()
-    {
-        var connection = new FakeSsapConnection();
-        ForegroundIsHome(connection);
-        var harness = new TestHarness(connection, o =>
-        {
-            o.LaunchVerifyTimeoutSeconds = 6;
-            o.LaunchPollIntervalSeconds = 2;
-        });
-
-        await Assert.ThrowsAsync<TvException>(
-            () => harness.Control.PlayYouTubeAsync("dQw4w9WgXcQ", CancellationToken.None));
-
-        // 6s budget at a 2s interval is three polls.
-        Assert.Equal(3, harness.Delay.Count);
     }
 
     // ------------------------------------------------------ youtube search

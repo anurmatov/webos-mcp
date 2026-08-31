@@ -7,9 +7,13 @@ media, navigation and notifications.
 Built on .NET 10. One shared tool layer is served over **stdio** (local MCP
 clients) and **Streamable HTTP** (container / network use), backed by three
 protocols: the LG **SSAP** WebSocket for control, **Wake-on-LAN** for power-on,
-and **DIAL** for launching YouTube in a way that can actually be verified.
+**DIAL** to discover the YouTube receiver, and the YouTube **Lounge** protocol to
+control it and read back what is actually playing.
 
-- **Local-first.** Talks to the TV on your LAN. No cloud service, no account.
+- **Local-first, with one documented exception.** Everything talks to the TV on
+  your LAN. YouTube playback control is the exception: it uses Google's Lounge
+  service, so it needs outbound internet. See
+  [YouTube control](#youtube-control-and-the-one-cloud-dependency).
 - **Typed and validated.** Every tool takes a typed request and validates its
   inputs before touching the TV.
 - **Single TV by design.** No device registry, no per-call routing.
@@ -254,6 +258,9 @@ network normally cannot receive it. Step 4 is last for that reason.
 | `WEBOSMCP__DIALPORTS` | `2038,1754,3000,8080,9080` | Ports probed directly on the TV. `2038` is first because that is the port LG webOS has been observed advertising DIAL on. |
 | `WEBOSMCP__DIALAPPLICATIONURL` | *(none)* | Skip discovery entirely, e.g. `http://192.0.2.10:2038/apps/`. The deterministic escape hatch when neither probing nor SSDP reaches the TV. |
 | `WEBOSMCP__DIALSSDPTIMEOUTSECONDS` | `3` | How long each SSDP search window stays open. |
+| `WEBOSMCP__LOUNGEBASEURL` | `https://www.youtube.com` | YouTube Lounge service. The one outbound-internet dependency. |
+| `WEBOSMCP__LOUNGEDEVICENAME` | `webos-mcp` | Name this remote presents to the receiver. |
+| `WEBOSMCP__LOUNGEVERIFYTIMEOUTSECONDS` | `30` | How long to wait for the receiver to confirm a command. |
 
 To find the right value for a stubborn TV, run `M-SEARCH` from a host on the
 same LAN and read the `LOCATION` header of the reply; that host and port are
@@ -328,33 +335,55 @@ registered by default**. Every tool returns
 | `tv_launch_app` | Launch an app by id. |
 | `tv_close_app` | Close a running app. |
 | `tv_open_url` | Open an **HTTPS-only** URL in the webOS browser. |
-| `tv_youtube_play` | Play a video by id, `youtu.be` link or watch URL. Launches over **DIAL**, cold-starting YouTube if it is already running, and confirms the app reached the foreground before reporting success. |
+| `tv_youtube_play` | Play a specific video by id, `youtu.be` link or watch URL. Loads it into the running receiver over **Lounge** and succeeds only once the receiver reports that video id playing. |
+| `tv_youtube_now_playing` | What the receiver says it is playing: video id, state, position. Pure observation. |
+| `tv_youtube_pause` / `tv_youtube_resume` | Pause or resume; succeeds only once the receiver reports the new state. |
+| `tv_youtube_seek` | Seek to a position in seconds. |
+| `tv_youtube_next` / `tv_youtube_previous` | Move through the receiver's queue. |
+| `tv_youtube_queue_add` | Append a video to the queue. `observed: false` — see below. |
+| `tv_youtube_set_receiver_volume` | The receiver's own volume, distinct from TV volume. |
+| `tv_youtube_set_autoplay` | Enable/disable autoplay. |
+| `tv_youtube_set_playback_speed` | 0.25–2.0. `observed: false` — see below. |
 | `tv_youtube_search` | **Not supported** — always returns `TV_UNSUPPORTED_CAPABILITY`. See below. |
 
 Content tools report which path ran — `"path": "DeepLink"` or `"path": "Dial"`.
 
-**`tv_youtube_play` never reports success on an accepted launch alone.** After
-the DIAL launch it polls the TV's own foreground-app report and only succeeds
-once YouTube actually appears. A launch the TV accepted but never acted on is
-reported as a failure, naming the app that was actually in the foreground.
+### YouTube control, and the one cloud dependency
 
-**A running YouTube session is stopped and cold-started.** A DIAL launch aimed
-at an app that is *already running* does not change what it is playing — the TV
-accepts the request and the previous video keeps going. Physical testing hit
-exactly that, and because YouTube was already in the foreground the old
-foreground check passed instantly and it was reported as success. So when
-YouTube is running, the tool now stops it over DIAL, waits for it to actually
-stop, and starts it cold with the requested video. Where the TV does not permit
-that — no `allowStop`, no instance link, or a stop that is accepted but never
-takes effect — the tool returns `TV_UNSUPPORTED_CAPABILITY` and does **not**
-launch. Expect the screen to go briefly to the home screen and back.
+**YouTube playback control does not run on your LAN.** DIAL is used only to
+discover the receiver's screen id; loading a specific video and reading back what
+is playing both go through Google's Lounge service at `youtube.com`. The server
+therefore needs outbound internet for YouTube tools — and only for those. Every
+other tool is LAN-only.
 
-**`exactVideoConfirmed` is always `false` on the DIAL path, by design.** DIAL
-exposes no way to read back which video is on screen. The video id is delivered
-to a freshly started app, which is what makes it take effect, but that is not
-the same as observing it play — so the response says so rather than letting a
-bare "success" imply proof. `coldStarted` reports whether a running session had
-to be restarted.
+This is a deliberate reversal of an earlier decision, made because DIAL provably
+cannot do the job:
+
+- A DIAL launch aimed at an **already-running** YouTube session is accepted and
+  ignored. The previous video keeps playing.
+- DIAL exposes **no read-back** of the playing video, so nothing on that path can
+  tell a correct launch from a wrong one.
+- Stopping and relaunching YouTube to force the video is **not** an acceptable
+  workaround: on a real TV it lands on the account/profile picker. The server
+  never does it.
+
+`tv_youtube_play` therefore succeeds only when the **receiver itself** reports the
+requested video id in a playing state. A different video, a merely cued or paused
+one, or a silent receiver are all reported as failures.
+
+**Read the `observed` field.** Every YouTube control response carries it:
+
+- `observed: true` — the receiver confirmed the effect by reporting its own state.
+- `observed: false` — the command was **accepted only**. The receiver announces no
+  event for it, so nothing was verified. `tv_youtube_queue_add` and
+  `tv_youtube_set_playback_speed` are always in this category. Physical probing
+  shows they do work; the server still refuses to call an unobserved effect a
+  confirmed one.
+
+**Not shipped:** captions and skip-ad. Both were accepted by the receiver during
+physical probing but produced no confirming event, and neither is worth a tool
+that can only ever say "accepted, no idea". They can be added if the receiver's
+event set turns out to cover them.
 
 **`tv_youtube_search` is deliberately unsupported.** Physical testing showed
 YouTube's custom on-screen keyboard silently ignoring
@@ -545,14 +574,14 @@ Specifically **not** claimed:
 - That every TV exposes a DIAL endpoint. Where it does not, `tv_youtube_play`
   reports `TV_UNSUPPORTED_CAPABILITY` rather than falling back to something
   unverifiable.
-- That the video reported as launched is the video on screen. DIAL cannot read
-  back the playing video; `exactVideoConfirmed` is always `false` on this path
-  and is not a claim we make. Confirming exactness would need the YouTube Lounge
-  API, which pairs through Google's cloud and is deliberately out of scope for a
-  local-first server — see the rejected alternatives in issue #1.
-- That a running YouTube session can always be stopped. `allowStop` is a
-  per-app, per-firmware option; without it the requested video cannot be made to
-  replace what is playing, and the tool says so instead of launching anyway.
+- That YouTube control works without internet access. It uses Google's Lounge
+  service; the rest of the server does not.
+- That the Lounge protocol is stable. It is undocumented and can change without
+  notice. When it does, YouTube tools fail loudly rather than silently degrading.
+- That a receiver always accepts remote control. Where it advertises no screen id
+  or refuses the session, YouTube tools return `TV_UNSUPPORTED_CAPABILITY`.
+- That `observed: false` commands took effect. They were accepted; nothing more
+  is claimed.
 - That the built-in `WEBOSMCP__DIALPORTS` list covers every model. `2038` is
   what LG webOS was observed using, not a value from a specification. If your
   TV advertises DIAL somewhere else, set `WEBOSMCP__DIALAPPLICATIONURL` or add
@@ -601,13 +630,14 @@ reply, and either add that port to `WEBOSMCP__DIALPORTS` or set
 `WEBOSMCP__DIALAPPLICATIONURL` to it directly. The server logs which ports it
 probed when resolution fails.
 
-**`tv_youtube_play` returns `TV_UNSUPPORTED_CAPABILITY` saying YouTube is
-already running and cannot be stopped.**
-The TV does not advertise `allowStop` for YouTube, or exposes no running-instance
-link. A DIAL launch cannot change the video of a running session, so honouring
-the request is impossible on this firmware. Stop YouTube on the TV (back out to
-the home screen) and call the tool again — from a stopped app the launch payload
-takes effect normally.
+**`tv_youtube_play` says the receiver advertises no screen id.**
+DIAL found YouTube but the status document carries no `screenId`, so there is no
+Lounge session to open. Nothing can be loaded or verified on this firmware.
+
+**YouTube tools fail while everything else works.**
+Check outbound access to `youtube.com`. YouTube control is the only part of this
+server that leaves the LAN, so a network that blocks egress breaks exactly these
+tools and nothing else.
 
 **`tv_youtube_play` fails naming HTTP 403.**
 The DIAL endpoint was found, and the TV refused the request. DIAL application

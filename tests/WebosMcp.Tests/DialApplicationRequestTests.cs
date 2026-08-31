@@ -70,31 +70,6 @@ public sealed class DialApplicationRequestTests
     }
 
     [Fact]
-    public async Task The_stop_is_a_DELETE_to_the_instance_url_carrying_the_origin()
-    {
-        var (client, http) = Build(HttpStatusCode.OK);
-
-        var stopped = await client.StopAppAsync(AppsUrl, "YouTube", "run", CancellationToken.None);
-
-        Assert.True(stopped);
-
-        var sent = Assert.Single(http.Requests);
-        Assert.Equal("DELETE", sent.Method);
-        Assert.Equal("http://192.0.2.10:2038/apps/YouTube/run", sent.Url);
-        Assert.Equal(YouTubeOrigin, sent.Origin);
-    }
-
-    [Fact]
-    public async Task A_refused_stop_reports_false_rather_than_throwing()
-    {
-        // The caller turns this into TV_UNSUPPORTED_CAPABILITY with its own context
-        // about why a cold start matters, so the client just reports the refusal.
-        var (client, _) = Build(HttpStatusCode.Forbidden);
-
-        Assert.False(await client.StopAppAsync(AppsUrl, "YouTube", "run", CancellationToken.None));
-    }
-
-    [Fact]
     public async Task An_app_with_no_known_origin_does_not_borrow_YouTubes()
     {
         // Claiming to be YouTube while calling something else would be a lie about

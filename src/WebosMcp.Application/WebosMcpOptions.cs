@@ -45,6 +45,24 @@ public sealed class WebosMcpOptions
     /// <summary>How long a single SSDP M-SEARCH window stays open.</summary>
     public int DialSsdpTimeoutSeconds { get; set; } = 3;
 
+    /// <summary>
+    /// YouTube Lounge service base URL. This is the ONE part of this server that
+    /// leaves the LAN: controlling an already-running YouTube receiver requires
+    /// Google's Lounge service, because DIAL cannot select a video in a running
+    /// session nor report which video is playing.
+    /// </summary>
+    public string LoungeBaseUrl { get; set; } = "https://www.youtube.com";
+
+    /// <summary>Name this remote presents to the receiver.</summary>
+    public string LoungeDeviceName { get; set; } = "webos-mcp";
+
+    /// <summary>
+    /// How long to wait for the receiver to report the requested video actually
+    /// playing. Expiring returns a failure naming what WAS observed — never an
+    /// unverified success.
+    /// </summary>
+    public int LoungeVerifyTimeoutSeconds { get; set; } = 30;
+
     /// <summary>Pre-paired client key supplied inline (environment variable).</summary>
     public string? ClientKey { get; set; }
 
