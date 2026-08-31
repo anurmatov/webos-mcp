@@ -1,8 +1,8 @@
 # Example deployment. Copy to docker-compose.yml and edit.
 #
-# Every value below is a documentation-only placeholder. Replace the host and
-# MAC with your own, and supply the client key and HTTP token as real secrets —
-# never commit them.
+# Every value below is a documentation-only placeholder. Register your TV with
+# the typed `tv_register_device` MCP tool after startup, and supply the HTTP
+# token as a real secret — never commit it.
 
 services:
   webos-mcp:
@@ -23,12 +23,18 @@ services:
 
     environment:
       # --- TV connection -------------------------------------------------
-      WEBOSMCP__HOST: "192.0.2.10"
+      # Explicit values override the durable device book. Leave these unset when
+      # following the typed registration flow in the README.
+      # WEBOSMCP__HOST: "192.0.2.10"
       WEBOSMCP__PORT: "3000"
-      WEBOSMCP__MACADDRESS: "00:11:22:33:44:55"
+      # WEBOSMCP__MACADDRESS: "00:11:22:33:44:55"
 
       # Set this to your subnet's broadcast address for the most reliable WOL.
-      WEBOSMCP__BROADCASTADDRESS: "192.0.2.255"
+      # WEBOSMCP__BROADCASTADDRESS: "192.0.2.255"
+
+      # Persist the typed device registry beside the client key in the named
+      # volume mounted below.
+      WEBOSMCP__DEVICESTOREPATH: "/var/lib/webos-mcp/devices.json"
 
       # --- DIAL (YouTube playback) ---------------------------------------
       # DIAL is normally advertised over SSDP multicast, which a container on a
