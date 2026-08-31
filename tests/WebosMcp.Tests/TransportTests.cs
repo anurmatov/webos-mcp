@@ -42,6 +42,7 @@ public sealed class TransportTests
         "tv_send_button",
         "tv_list_inputs",
         "tv_show_toast",
+        "tv_take_screenshot",
     ];
 
     internal static void ReplaceTvWithFake(IServiceCollection services, FakeSsapConnection connection)
@@ -60,6 +61,11 @@ public sealed class TransportTests
 
         services.RemoveAll<IDialClient>();
         services.AddSingleton<IDialClient>(new FakeDialClient());
+
+        // Replaced unconditionally, not only for screenshot tests: leaving the real
+        // downloader registered would let a future test reach the network.
+        services.RemoveAll<IScreenshotDownloader>();
+        services.AddSingleton<IScreenshotDownloader>(new FakeScreenshotDownloader());
 
         services.Configure<WebosMcpOptions>(options =>
         {
@@ -325,7 +331,7 @@ public sealed class TransportTests
     }
 
     [Fact]
-    public async Task No_tool_exposes_a_raw_command_or_screenshot_surface()
+    public async Task No_tool_exposes_a_raw_command_surface()
     {
         var names = RegisteredToolNames(enablePairing: false);
         Assert.NotEmpty(names);
@@ -333,7 +339,7 @@ public sealed class TransportTests
         // "pair" is no longer in this list: pairing is an approved, opt-in
         // surface. Its absence by default is asserted separately below, so the
         // two boundaries stay independently verifiable.
-        string[] forbidden = ["ssap", "raw", "command", "screenshot", "capture", "exec"];
+        string[] forbidden = ["ssap", "raw", "command", "exec"];
         foreach (var name in names)
         {
             foreach (var word in forbidden)
@@ -345,6 +351,42 @@ public sealed class TransportTests
         }
 
         await Task.CompletedTask;
+    }
+
+    [Fact]
+    public void Frame_capture_is_exactly_one_approved_read_only_tool()
+    {
+        // Capture used to be prohibited outright and is now a single, named,
+        // read-only tool. The boundary did not disappear — it narrowed, so it is
+        // asserted as an allowlist: any SECOND capture-shaped tool (recording,
+        // polling, a frame grabber taking a URI) fails this.
+        string[] capture = ["screenshot", "capture", "record", "frame"];
+
+        var matches = RegisteredToolNames(enablePairing: true)
+            .Where(name => capture.Any(word => name.Contains(word, StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+
+        Assert.Equal(["tv_take_screenshot"], matches);
+    }
+
+    [Fact]
+    public async Task The_screenshot_tool_takes_no_arguments_at_all()
+    {
+        // The real boundary is not the tool's name: it is that no caller can
+        // influence what is requested. An empty schema is what makes the capture
+        // URI unreachable from outside — a single added parameter would reopen it.
+        await using var fixture = await StdioFixture.StartAsync(new FakeSsapConnection());
+
+        var tool = (await fixture.Client.ListToolsAsync(cancellationToken: CancellationToken.None))
+            .Single(t => t.Name == "tv_take_screenshot");
+
+        var schema = JsonSerializer.SerializeToElement(tool.ProtocolTool.InputSchema);
+
+        var properties = schema.TryGetProperty("properties", out var declared)
+            ? declared.EnumerateObject().Select(p => p.Name).ToArray()
+            : [];
+
+        Assert.Empty(properties);
     }
 
     [Fact]
@@ -398,6 +440,63 @@ public sealed class TransportTests
 
     private static string GetText(CallToolResult result) =>
         string.Concat(result.Content.OfType<TextContentBlock>().Select(c => c.Text));
+
+    [Fact]
+    public async Task Http_transport_returns_a_screenshot_as_a_native_image_content_block()
+    {
+        // The wire shape, not the service method. A tool can return the right
+        // object and still be double-wrapped into JSON text by the SDK, which is
+        // exactly the leaky outcome the contract forbids — only a real tools/call
+        // over the real transport can tell the two apart.
+        var connection = new FakeSsapConnection();
+        connection.Respond(
+            "ssap://tv/executeOneShot",
+            """{"returnValue":true,"imageUri":"http://192.0.2.10:9080/tmp/capture.jpg"}""");
+
+        var settings = new HttpTransportSettings
+        {
+            BindAddress = "0.0.0.0",
+            Port = 8765,
+            Token = "s3cret",
+        };
+
+        await using var app = BuildHttpApp(settings, connection);
+        await app.StartAsync(CancellationToken.None);
+
+        var httpClient = app.GetTestClient();
+        httpClient.BaseAddress = new Uri("http://localhost/");
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", "s3cret");
+
+        var transport = new HttpClientTransport(
+            new HttpClientTransportOptions
+            {
+                Endpoint = new Uri("http://localhost/"),
+                TransportMode = HttpTransportMode.StreamableHttp,
+            },
+            httpClient,
+            NullLoggerFactory.Instance,
+            ownsHttpClient: true);
+
+        await using var client = await McpClient.CreateAsync(
+            transport, cancellationToken: CancellationToken.None);
+
+        var result = await client.CallToolAsync(
+            "tv_take_screenshot", cancellationToken: CancellationToken.None);
+
+        Assert.NotEqual(true, result.IsError);
+
+        var block = Assert.IsType<ImageContentBlock>(Assert.Single(result.Content));
+        Assert.Equal("image/jpeg", block.MimeType);
+
+        // Decoded by the CLIENT, from the wire. This is what fails if the block is
+        // built with raw bytes in Data instead of base64 text.
+        Assert.Equal(FakeScreenshotDownloader.SyntheticJpeg, block.DecodedData.ToArray());
+
+        // No text or base64-string content block alongside it.
+        Assert.Empty(result.Content.OfType<TextContentBlock>());
+
+        await app.StopAsync(CancellationToken.None);
+    }
 }
 
 /// <summary>

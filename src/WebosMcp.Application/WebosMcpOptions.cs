@@ -123,6 +123,23 @@ public sealed class WebosMcpOptions
     public int ConnectTimeoutSeconds { get; set; } = 10;
 
     /// <summary>
+    /// Bound on the screenshot download, separate from
+    /// <see cref="RequestTimeoutSeconds"/> because it covers a different hop: the
+    /// SSAP call that produces the URI has already completed by then, and the
+    /// download runs outside the SSAP session so a slow fetch cannot hold the
+    /// control channel's gate.
+    /// </summary>
+    public int ScreenshotTimeoutSeconds { get; set; } = 15;
+
+    /// <summary>
+    /// Hard cap on a captured frame. The download is streamed and aborted the
+    /// moment this is exceeded — the body is never buffered unbounded. A panel
+    /// frame is a few hundred kilobytes, so this is deliberately generous while
+    /// still bounded.
+    /// </summary>
+    public int ScreenshotMaxBytes { get; set; } = 8 * 1024 * 1024;
+
+    /// <summary>
     /// How long to wait for an app launched over DIAL to actually reach the
     /// foreground. A launch that is accepted but never appears is a failure,
     /// not a slow success.

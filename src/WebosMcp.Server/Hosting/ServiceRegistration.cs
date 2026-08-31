@@ -46,6 +46,34 @@ public static class ServiceRegistration
             client.DefaultRequestHeaders.UserAgent.ParseAdd("webos-mcp/1.0");
         });
 
+        // The screenshot download gets its OWN client and its own primary handler.
+        // Two properties depend on that isolation and would be wrong on a shared
+        // one: redirects are followed manually so every hop can be re-pinned to the
+        // TV, and a self-signed certificate is tolerated ONLY for the selected TV's
+        // host. Neither leaks to the DIAL or Lounge clients, and TLS validation is
+        // never globally disabled.
+        services
+            .AddHttpClient<IScreenshotDownloader, ScreenshotDownloader>(client =>
+            {
+                // The downloader applies its own bounded timeout; a second,
+                // independent one here would report the wrong failure.
+                client.Timeout = Timeout.InfiniteTimeSpan;
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("webos-mcp/1.0");
+            })
+            .ConfigurePrimaryHttpMessageHandler(provider =>
+            {
+                var options = provider.GetRequiredService<
+                    Microsoft.Extensions.Options.IOptions<WebosMcpOptions>>();
+
+                return new HttpClientHandler
+                {
+                    AllowAutoRedirect = false,
+                    ServerCertificateCustomValidationCallback = (request, _, _, errors) =>
+                        errors == System.Net.Security.SslPolicyErrors.None ||
+                        ScreenshotPolicy.IsSelectedTvHost(request.RequestUri, options.Value),
+                };
+            });
+
         services.AddSingleton<IDelayProvider, RealDelayProvider>();
 
         services.AddSingleton<ITvSession, TvSession>();

@@ -292,6 +292,19 @@ public interface ILoungeClient
     Task<ILoungeSession?> ConnectAsync(string screenId, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Fetches the capture the TV announced. Behind an interface for the same reason
+/// every other network boundary is: the whole suite runs in CI with no TV, and
+/// the redirect, size and timeout rules are exercised without a real socket.
+///
+/// Implementations MUST re-pin every hop to the selected TV, cap the body size
+/// while streaming, and never write the bytes anywhere.
+/// </summary>
+public interface IScreenshotDownloader
+{
+    Task<ReadOnlyMemory<byte>> DownloadAsync(Uri imageUri, CancellationToken cancellationToken);
+}
+
 public interface ITvDiscovery
 {
     Task<IReadOnlyList<DiscoveredTv>> DiscoverAsync(TimeSpan timeout, CancellationToken cancellationToken);

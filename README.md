@@ -17,8 +17,8 @@ control it and read back what is actually playing.
 - **Typed and validated.** Every tool takes a typed request and validates its
   inputs before touching the TV.
 - **Single TV by design.** No device registry, no per-call routing.
-- **Deliberately narrow.** No raw command passthrough, no screenshot capture,
-  no hidden/service-menu actions. See [Hard boundaries](#hard-boundaries).
+- **Deliberately narrow.** No raw command passthrough, no screen recording, no
+  hidden/service-menu actions. See [Hard boundaries](#hard-boundaries).
 - **Pairing is opt-in.** By default no pairing tool is exposed at all. It can be
   enabled explicitly — see [Pairing over MCP](#pairing-over-mcp-opt-in).
 
@@ -332,6 +332,8 @@ reports `TV_UNSUPPORTED_CAPABILITY` rather than a false success.
 | `WEBOSMCP__POWERONVERIFYTIMEOUTSECONDS` | `60` | How long `tv_power_on` polls for an Active state. |
 | `WEBOSMCP__POWERONPOLLINTERVALSECONDS` | `3` | Interval between those polls. |
 | `WEBOSMCP__FALLBACKSTEPDELAYMILLISECONDS` | `400` | Pacing between steps of a bounded fallback sequence. |
+| `WEBOSMCP__SCREENSHOTTIMEOUTSECONDS` | `15` | Bound on the screenshot download. Separate from the SSAP timeout: the download runs outside the SSAP session, so a slow fetch cannot hold the control channel. |
+| `WEBOSMCP__SCREENSHOTMAXBYTES` | `8388608` | Maximum captured frame. Enforced while streaming — an oversized body is aborted, never buffered. |
 
 ### HTTP transport
 
@@ -349,9 +351,19 @@ process listings.
 
 ## Tools
 
-34 tools across seven groups, plus one opt-in pairing tool that is **not
-registered by default**. Every tool returns
-`{ "ok": true, "result": … }` or `{ "ok": false, "error": { "code", "message" } }`.
+**52 tools**, counted at this commit: 51 registered by default, plus one opt-in
+pairing tool that is **not registered by default**. The device-setup tools
+(`tv_discover_devices`, `tv_register_device`, `tv_list_devices`,
+`tv_select_device`, `tv_update_device`, `tv_remove_device`) are part of that
+total and are documented under
+[Device setup](#device-setup-without-environment-variables) rather than repeated
+here.
+
+Every tool returns `{ "ok": true, "result": … }` or
+`{ "ok": false, "error": { "code", "message" } }`. The one exception is
+[`tv_take_screenshot`](#screenshot), whose success is a native MCP **image**
+content block — the envelope is text and an image is not. Its failures use the
+same envelope as everything else.
 
 ### Status
 
@@ -362,6 +374,48 @@ registered by default**. Every tool returns
 | `tv_get_foreground_app` | The app currently in the foreground. |
 | `tv_list_apps` | Installed apps with their launch ids. |
 | `tv_get_status` | Combined snapshot: power, foreground app and volume state. |
+
+### Screenshot
+
+| Tool | Description |
+|---|---|
+| `tv_take_screenshot` | Capture the frame currently on screen and return it as an image. Read-only, no arguments. |
+
+**Sensitive by nature.** A capture shows whatever the household is watching. The
+tool description tells a model to invoke it **only in direct response to an
+explicit request from the user right now** — never proactively, on a schedule, in
+a loop, or in the background. That is a stated contract, not an enforced one: the
+server has no caller-identity mechanism, and deliberately does not grow one to
+fake enforcement here.
+
+**A black image is a successful capture.** The screen may genuinely be black, or
+the content may be DRM-protected and capture as black. Neither is distinguishable
+from the outside, so the server does not inspect the frame and reports neither as
+an error.
+
+**Model- and firmware-dependent.** The capture uses `ssap://tv/executeOneShot`,
+which LG does not document or guarantee. Sets whose firmware lacks it return
+`TV_UNSUPPORTED_CAPABILITY`.
+
+How the frame is handled, and why each rule is there:
+
+- **In memory only, for the duration of the request.** Never written to the
+  device store, a temp file, a cache, a log line or any telemetry. Nothing is
+  logged about a capture beyond its size and detected format.
+- **The announced URI is untrusted.** The TV answers with an `imageUri` that the
+  server then fetches, which makes the TV an input rather than an authority. Only
+  `http` and `https` are accepted, userinfo is rejected, and **every** hop — the
+  first request and each redirect — must stay on the currently selected TV's host.
+  A cross-host `imageUri` or redirect is `INVALID_INPUT`, refused *before* the
+  request goes out rather than after.
+- **Bounded.** Its own timeout and a streamed maximum body size, both
+  configurable; an oversized body is aborted mid-read rather than buffered.
+- **Validated as a real image by its bytes**, not by the `Content-Type` header. An
+  empty, oversized, HTML or otherwise non-image body is `TV_ERROR` and never a
+  reported success — a header saying `image/jpeg` is not evidence.
+- **TLS validation is never globally disabled.** A self-signed certificate is
+  tolerated only for the selected TV's own host, on this download's own HTTP
+  handler, and nowhere else in the process.
 
 ### Power and display
 
@@ -553,7 +607,12 @@ Deliberately absent, and not open to reconsideration as features:
   server will call is closed and compiled in. An MCP client cannot supply a
   URI. This is the core safety boundary: without it, every other validation
   guarantee is meaningless.
-- **No screenshot or frame capture of any kind.**
+- **No screen recording, polling or repeated capture.** Frame capture exists as
+  exactly one read-only, on-demand tool ([`tv_take_screenshot`](#screenshot)) and
+  will not grow into a capture loop, a scheduled grab, or OCR/analysis of the
+  captured frame. The tool takes no arguments at all, so nothing a caller supplies
+  can influence what is requested — which is the same boundary as the closed SSAP
+  list, applied to the one endpoint that returns a URI.
 - **No hidden, service-menu or factory commands.**
 - **No multi-device orchestration.** One configured TV per instance.
 - **The client key is never returned by a tool, exposed in a log line, or
@@ -769,8 +828,9 @@ behind an interface, which is what lets the whole suite run in CI. CI builds,
 runs the tests, and builds the container image on every pull request.
 
 Contributions are welcome, with one standing exception: pull requests adding a
-raw command passthrough, a screenshot tool, hidden/service-menu commands, or
-multi-device orchestration will be declined. Those are
+raw command passthrough, screen recording or repeated/scheduled capture, OCR or
+analysis of a captured frame, hidden/service-menu commands, or multi-device
+orchestration will be declined. Those are
 [deliberate boundaries](#hard-boundaries), not gaps.
 
 ---
