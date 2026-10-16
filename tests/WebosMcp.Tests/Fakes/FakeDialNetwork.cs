@@ -172,3 +172,101 @@ public sealed class FakeSsdpChannel : ISsdpChannel
         "ST: urn:dial-multiscreen-org:service:dial:1\r\n" +
         $"LOCATION: {location}\r\n\r\n";
 }
+
+/// <summary>How the scripted TV answers a DIAL status read on a given port.</summary>
+public enum DialPortBehaviour
+{
+    Running,
+    Refused,
+    Hang,
+    NotFound,
+    Forbidden,
+}
+
+/// <summary>
+/// A TV whose DIAL port can move, as it does after a reboot. Device-description
+/// probes answer only on <see cref="CurrentPort"/>; a status read on any port
+/// follows <see cref="StatusByPort"/> (default: running on the current port,
+/// connection refused elsewhere).
+/// </summary>
+public sealed class MovingDialHttpHandler : HttpMessageHandler
+{
+    private readonly string _host;
+
+    public MovingDialHttpHandler(string host, int currentPort)
+    {
+        _host = host;
+        CurrentPort = currentPort;
+    }
+
+    public int CurrentPort { get; set; }
+
+    public Dictionary<int, DialPortBehaviour> StatusByPort { get; } = [];
+
+    /// <summary>Signalled when a status read starts hanging, so a test can cancel at the right moment.</summary>
+    public TaskCompletionSource HangStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    protected override async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        var uri = request.RequestUri!;
+
+        if (uri.AbsolutePath == "/")
+        {
+            if (uri.Port != CurrentPort)
+            {
+                throw new HttpRequestException("Connection refused");
+            }
+
+            var probe = new HttpResponseMessage(HttpStatusCode.OK);
+            probe.Headers.TryAddWithoutValidation("Application-URL", $"http://{_host}:{uri.Port}/apps/");
+            return probe;
+        }
+
+        var behaviour = StatusByPort.TryGetValue(uri.Port, out var scripted)
+            ? scripted
+            : uri.Port == CurrentPort ? DialPortBehaviour.Running : DialPortBehaviour.Refused;
+
+        switch (behaviour)
+        {
+            case DialPortBehaviour.Refused:
+                throw new HttpRequestException("Connection refused");
+            case DialPortBehaviour.Hang:
+                HangStarted.TrySetResult();
+                await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+                throw new InvalidOperationException("unreachable");
+            case DialPortBehaviour.NotFound:
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            case DialPortBehaviour.Forbidden:
+                return new HttpResponseMessage(HttpStatusCode.Forbidden);
+            default:
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "<service xmlns=\"urn:dial-multiscreen-org:schemas:dial\"><name>YouTube</name>" +
+                        "<state>running</state><additionalData><screenId>screen-1</screenId></additionalData></service>"),
+                };
+        }
+    }
+}
+
+/// <summary>Counts resolutions on a real DIAL client, so a test can bound re-resolves per call.</summary>
+public sealed class CountingDialClient(IDialClient inner) : IDialClient
+{
+    public int ResolveCount { get; private set; }
+
+    public async Task<DialResolution?> ResolveApplicationUrlAsync(CancellationToken cancellationToken)
+    {
+        ResolveCount++;
+        return await inner.ResolveApplicationUrlAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public void InvalidateApplicationUrl(Uri stale) => inner.InvalidateApplicationUrl(stale);
+
+    public Task<DialAppStatus?> GetAppStatusAsync(Uri applicationUrl, string app, CancellationToken cancellationToken) =>
+        inner.GetAppStatusAsync(applicationUrl, app, cancellationToken);
+
+    public Task<bool> LaunchAppAsync(Uri applicationUrl, string app, string payload, CancellationToken cancellationToken) =>
+        inner.LaunchAppAsync(applicationUrl, app, payload, cancellationToken);
+}

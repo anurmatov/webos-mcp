@@ -32,8 +32,10 @@ public sealed partial class DialClient : IDialClient, IDisposable
 
     // The application URL rarely changes, and rediscovery costs an SSDP round.
     // Cached against the host it was resolved for: selecting a different device must
-    // not keep serving the previous TV's endpoint.
-    private Uri? _cachedApplicationUrl;
+    // not keep serving the previous TV's endpoint. A TV reboot can still move the
+    // port, so a caller that finds the cached URL dead invalidates it.
+    private readonly Lock _cacheLock = new();
+    private DialResolution? _cached;
     private string? _cachedForHost;
 
     public DialClient(
@@ -51,26 +53,27 @@ public sealed partial class DialClient : IDialClient, IDisposable
     [GeneratedRegex(@"^(?<name>[A-Za-z\-]+)\s*:\s*(?<value>.*)$", RegexOptions.Multiline)]
     private static partial Regex HeaderPattern();
 
-    public async Task<Uri?> ResolveApplicationUrlAsync(CancellationToken cancellationToken)
+    public async Task<DialResolution?> ResolveApplicationUrlAsync(CancellationToken cancellationToken)
     {
-        if (!string.Equals(_cachedForHost, _options.Host, StringComparison.OrdinalIgnoreCase))
+        lock (_cacheLock)
         {
-            _cachedApplicationUrl = null;
-            _cachedForHost = _options.Host;
-        }
+            if (!string.Equals(_cachedForHost, _options.Host, StringComparison.OrdinalIgnoreCase))
+            {
+                _cached = null;
+                _cachedForHost = _options.Host;
+            }
 
-        if (_cachedApplicationUrl is not null)
-        {
-            return _cachedApplicationUrl;
+            if (_cached is not null)
+            {
+                return _cached with { FromCache = true };
+            }
         }
 
         // 1. An explicitly configured URL is authoritative — no discovery at all.
         var configured = _options.ResolvedDialApplicationUrl;
         if (configured is not null)
         {
-            _logger.LogInformation("Using the configured DIAL application URL.");
-            _cachedApplicationUrl = configured;
-            return configured;
+            return Cache(configured, DialResolutionStrategy.Configured);
         }
 
         // 2. Probe the known host directly. This is the path that has to work in a
@@ -93,9 +96,7 @@ public sealed partial class DialClient : IDialClient, IDisposable
             {
                 if (results[i] is { } hit)
                 {
-                    _logger.LogInformation("Resolved DIAL on {Host}:{Port} by direct probe.", _options.Host, ports[i]);
-                    _cachedApplicationUrl = hit;
-                    return hit;
+                    return Cache(hit, DialResolutionStrategy.DirectProbe);
                 }
             }
         }
@@ -106,24 +107,65 @@ public sealed partial class DialClient : IDialClient, IDisposable
         var viaUnicast = await SearchAsync(UnicastSsdpTarget(), cancellationToken).ConfigureAwait(false);
         if (viaUnicast is not null)
         {
-            _cachedApplicationUrl = viaUnicast;
-            return viaUnicast;
+            return Cache(viaUnicast, DialResolutionStrategy.UnicastSsdp);
         }
 
         // 4. Multicast, last. It is the one strategy a container usually cannot use.
         var viaMulticast = await SearchAsync(
             new IPEndPoint(IPAddress.Parse(SsdpAddress), SsdpPort), cancellationToken).ConfigureAwait(false);
 
-        if (viaMulticast is null)
+        if (viaMulticast is not null)
         {
-            _logger.LogInformation(
-                "No DIAL endpoint found: probed {Host} on ports {Ports}, then unicast and multicast SSDP.",
-                _options.Host, _options.DialPorts);
+            return Cache(viaMulticast, DialResolutionStrategy.MulticastSsdp);
         }
 
-        _cachedApplicationUrl = viaMulticast;
-        return viaMulticast;
+        // Not cached: the next call retries discovery.
+        _logger.LogInformation(
+            "No DIAL endpoint found: probed {Host} on ports {Ports}, then unicast and multicast SSDP.",
+            _options.Host, _options.DialPorts);
+
+        return null;
     }
+
+    public void InvalidateApplicationUrl(Uri stale)
+    {
+        lock (_cacheLock)
+        {
+            if (_cached is not null && _cached.ApplicationUrl == stale)
+            {
+                _cached = null;
+                _logger.LogInformation(
+                    "Dropped the cached DIAL application URL on port {Port}: it stopped answering.", stale.Port);
+            }
+        }
+    }
+
+    /// <summary>Caches a fresh resolution for the current host and logs which strategy found it.</summary>
+    private DialResolution Cache(Uri applicationUrl, DialResolutionStrategy strategy)
+    {
+        _logger.LogInformation(
+            "Resolved DIAL by {Strategy} on port {Port}.", StrategyName(strategy), applicationUrl.Port);
+
+        var resolution = new DialResolution(applicationUrl, strategy, FromCache: false);
+        lock (_cacheLock)
+        {
+            if (string.Equals(_cachedForHost, _options.Host, StringComparison.OrdinalIgnoreCase))
+            {
+                _cached = resolution;
+            }
+        }
+
+        return resolution;
+    }
+
+    internal static string StrategyName(DialResolutionStrategy strategy) => strategy switch
+    {
+        DialResolutionStrategy.Configured => "configured",
+        DialResolutionStrategy.DirectProbe => "direct-probe",
+        DialResolutionStrategy.UnicastSsdp => "unicast-ssdp",
+        DialResolutionStrategy.MulticastSsdp => "multicast-ssdp",
+        _ => strategy.ToString(),
+    };
 
     /// <summary>
     /// The configured TV's SSDP port, or null when no usable host is configured.
@@ -222,7 +264,6 @@ public sealed partial class DialClient : IDialClient, IDisposable
             var appsUrl = await ProbeDeviceDescriptionAsync(uri, cancellationToken).ConfigureAwait(false);
             if (appsUrl is not null)
             {
-                _logger.LogInformation("Resolved DIAL via SSDP search to {Target}.", target);
                 return appsUrl;
             }
         }

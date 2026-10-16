@@ -11,7 +11,8 @@ public sealed class TestHarness
     public TestHarness(
         FakeSsapConnection? connection = null,
         Action<WebosMcpOptions>? configure = null,
-        ILoggerFactory? loggerFactory = null)
+        ILoggerFactory? loggerFactory = null,
+        IDialClient? dial = null)
     {
         Connection = connection ?? new FakeSsapConnection();
         Factory = new FakeSsapConnectionFactory().Enqueue(Connection);
@@ -45,7 +46,7 @@ public sealed class TestHarness
 
         Session = new TvSession(Factory, KeyStore, wrapped, LoggerFactory.CreateLogger<TvSession>());
         Control = new TvControlService(
-            Session, Delay, Dial, Lounge, Downloader, wrapped, LoggerFactory.CreateLogger<TvControlService>());
+            Session, Delay, dial ?? Dial, Lounge, Downloader, wrapped, LoggerFactory.CreateLogger<TvControlService>());
         Power = new PowerService(Wol, Control, Delay, wrapped, LoggerFactory.CreateLogger<PowerService>());
     }
 

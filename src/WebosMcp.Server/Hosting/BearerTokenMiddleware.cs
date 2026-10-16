@@ -33,8 +33,8 @@ public sealed class BearerTokenMiddleware
     {
         if (_expected is null)
         {
-            // No token configured. Only reachable on a loopback bind — the
-            // startup guard refuses any other combination.
+            // No token configured. Only reachable on a loopback bind or a unix
+            // socket — the startup guard refuses any other combination.
             await _next(context).ConfigureAwait(false);
             return;
         }

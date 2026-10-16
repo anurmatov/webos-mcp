@@ -110,9 +110,27 @@ validation.
 | `WEBOS_MCP_HTTP_PORT` | `8765` | Listen port. |
 | `WEBOS_MCP_HTTP_TOKEN` | none | Bearer token supplied inline. |
 | `WEBOS_MCP_HTTP_TOKEN_FILE` | none | Mounted token file; takes precedence over the inline value. |
+| `WEBOS_MCP_HTTP_UNIX_SOCKET` | none | Absolute path. When set, the server listens only on this unix socket and opens no TCP port. |
+| `WEBOS_MCP_HTTP_UNIX_SOCKET_MODE` | `0600` | File mode applied to the socket: `0600` or `0660`. Any other value fails startup. |
 
 The token is never accepted as a command-line argument because process command
 lines are visible to other software on the host.
+
+### Unix socket listener
+
+Socket mode suits a reverse proxy that shares a volume with the server, for
+example when the server runs with `network_mode: host` for SSDP and Wake-on-LAN
+but must not listen on the host's network. It is Linux and macOS only.
+
+- Setting the socket together with a non-empty `WEBOS_MCP_HTTP_BIND` or
+  `WEBOS_MCP_HTTP_PORT` fails startup; the socket replaces the TCP listener.
+- The socket's directory must exist and be writable by the server.
+- A socket left by a previous run is removed at startup. A regular file,
+  directory or symlink at the path fails startup and is left untouched.
+- The mode is applied right after the bind; until then requests get `503`.
+  With `0660`, any process in the socket's group can connect, so give the
+  directory a setgid group that only the proxy holds.
+- A configured token is still required on every request.
 
 ### Security posture
 

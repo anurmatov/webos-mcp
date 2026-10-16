@@ -38,9 +38,10 @@ USER webosmcp
 # write one, so pairing needs somewhere of its own to persist to.
 VOLUME ["/var/lib/webos-mcp"]
 
+# The HTTP bind and port are not set here: the code defaults are the same
+# (127.0.0.1:8765), and baking them in would block WEBOS_MCP_HTTP_UNIX_SOCKET,
+# which refuses to start alongside a bind or port.
 ENV DOTNET_EnableDiagnostics=0 \
-    WEBOS_MCP_HTTP_BIND=127.0.0.1 \
-    WEBOS_MCP_HTTP_PORT=8765 \
     WEBOSMCP__CLIENTKEYPATH=/var/lib/webos-mcp/clientkey.json
 
 # No EXPOSE and no published port by default. The HTTP transport binds to

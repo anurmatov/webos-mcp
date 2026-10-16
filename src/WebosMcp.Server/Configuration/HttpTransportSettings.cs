@@ -10,6 +10,10 @@ namespace WebosMcp.Server.Configuration;
 /// assumption. Default bind is loopback-only; any non-loopback bind REQUIRES a
 /// token, and the server refuses to start otherwise rather than silently
 /// serving unauthenticated TV control to the network.
+///
+/// Alternatively the transport can listen only on a unix socket
+/// (<see cref="UnixSocketVariable"/>), opening no TCP port at all. Access is then
+/// governed by the socket's file mode (0600 or 0660) and its directory.
 /// </summary>
 public sealed class HttpTransportSettings
 {
@@ -20,6 +24,11 @@ public sealed class HttpTransportSettings
     public const string TokenFileVariable = "WEBOS_MCP_HTTP_TOKEN_FILE";
     public const string BindVariable = "WEBOS_MCP_HTTP_BIND";
     public const string PortVariable = "WEBOS_MCP_HTTP_PORT";
+    public const string UnixSocketVariable = "WEBOS_MCP_HTTP_UNIX_SOCKET";
+    public const string UnixSocketModeVariable = "WEBOS_MCP_HTTP_UNIX_SOCKET_MODE";
+
+    private const UnixFileMode OwnerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+    private const UnixFileMode OwnerAndGroup = OwnerOnly | UnixFileMode.GroupRead | UnixFileMode.GroupWrite;
 
     public required string BindAddress { get; init; }
 
@@ -28,9 +37,15 @@ public sealed class HttpTransportSettings
     /// <summary>Null when no token is configured (only legal on a loopback bind).</summary>
     public string? Token { get; init; }
 
+    /// <summary>When set, the transport listens only on this unix socket and opens no TCP port.</summary>
+    public string? UnixSocketPath { get; init; }
+
+    /// <summary>The file mode applied to <see cref="UnixSocketPath"/> before any request is served.</summary>
+    public UnixFileMode UnixSocketMode { get; init; } = OwnerOnly;
+
     public bool RequiresAuth => !string.IsNullOrEmpty(Token);
 
-    public string Url => $"http://{BindAddress}:{Port}";
+    public string Url => UnixSocketPath is null ? $"http://{BindAddress}:{Port}" : $"http://unix:{UnixSocketPath}";
 
     /// <summary>
     /// Resolves settings from the environment and enforces the bind/token
@@ -39,6 +54,20 @@ public sealed class HttpTransportSettings
     /// </summary>
     public static HttpTransportSettings Resolve(IReadOnlyDictionary<string, string?> environment)
     {
+        var socketPath = Value(environment, UnixSocketVariable);
+        var modeText = Value(environment, UnixSocketModeVariable);
+
+        if (socketPath is not null)
+        {
+            return ResolveUnixSocket(environment, socketPath, modeText);
+        }
+
+        if (modeText is not null)
+        {
+            throw new HttpTransportConfigurationException(
+                $"{UnixSocketModeVariable} is set but {UnixSocketVariable} is not. Set both, or neither.");
+        }
+
         var bind = Value(environment, BindVariable) ?? DefaultBindAddress;
         var portText = Value(environment, PortVariable);
 
@@ -67,6 +96,50 @@ public sealed class HttpTransportSettings
             BindAddress = bind,
             Port = port,
             Token = token,
+        };
+    }
+
+    private static HttpTransportSettings ResolveUnixSocket(
+        IReadOnlyDictionary<string, string?> environment,
+        string socketPath,
+        string? modeText)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            throw new HttpTransportConfigurationException(
+                $"{UnixSocketVariable} is supported on Linux and macOS only.");
+        }
+
+        if (!Path.IsPathFullyQualified(socketPath))
+        {
+            throw new HttpTransportConfigurationException(
+                $"{UnixSocketVariable} must be an absolute path; got '{socketPath}'.");
+        }
+
+        // A socket together with a TCP bind or port is ambiguous intent: fail loudly
+        // rather than guess which listener the operator meant.
+        if (Value(environment, BindVariable) is not null || Value(environment, PortVariable) is not null)
+        {
+            throw new HttpTransportConfigurationException(
+                $"Refusing to start: {UnixSocketVariable} is set together with {BindVariable} or {PortVariable}. " +
+                $"The unix socket replaces the TCP listener; unset {BindVariable} and {PortVariable}.");
+        }
+
+        var mode = modeText switch
+        {
+            null or "0600" => OwnerOnly,
+            "0660" => OwnerAndGroup,
+            _ => throw new HttpTransportConfigurationException(
+                $"{UnixSocketModeVariable} must be 0600 or 0660; got '{modeText}'."),
+        };
+
+        return new HttpTransportSettings
+        {
+            BindAddress = DefaultBindAddress,
+            Port = DefaultPort,
+            Token = ResolveToken(environment),
+            UnixSocketPath = socketPath,
+            UnixSocketMode = mode,
         };
     }
 
@@ -142,6 +215,8 @@ public sealed class HttpTransportSettings
             [PortVariable] = Environment.GetEnvironmentVariable(PortVariable),
             [TokenVariable] = Environment.GetEnvironmentVariable(TokenVariable),
             [TokenFileVariable] = Environment.GetEnvironmentVariable(TokenFileVariable),
+            [UnixSocketVariable] = Environment.GetEnvironmentVariable(UnixSocketVariable),
+            [UnixSocketModeVariable] = Environment.GetEnvironmentVariable(UnixSocketModeVariable),
         };
 }
 
