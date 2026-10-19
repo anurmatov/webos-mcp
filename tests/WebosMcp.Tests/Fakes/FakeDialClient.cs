@@ -25,11 +25,17 @@ public sealed class FakeDialClient : IDialClient
 
     public List<string> LaunchPayloads { get; } = [];
 
-    public Task<Uri?> ResolveApplicationUrlAsync(CancellationToken cancellationToken)
+    public Task<DialResolution?> ResolveApplicationUrlAsync(CancellationToken cancellationToken)
     {
         ResolveCount++;
-        return Task.FromResult(ApplicationUrl);
+        return Task.FromResult(ApplicationUrl is null
+            ? null
+            : new DialResolution(ApplicationUrl, DialResolutionStrategy.DirectProbe, FromCache: false));
     }
+
+    public List<Uri> Invalidated { get; } = [];
+
+    public void InvalidateApplicationUrl(Uri stale) => Invalidated.Add(stale);
 
     public Task<DialAppStatus?> GetAppStatusAsync(
         Uri applicationUrl, string app, CancellationToken cancellationToken) =>

@@ -406,17 +406,12 @@ public sealed class TvControlService
         var videoId = InputValidation.ValidateYouTubeVideoId(videoOrUrl);
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
 
-        var applicationUrl = await _dial.ResolveApplicationUrlAsync(ct).ConfigureAwait(false);
-        if (applicationUrl is null)
-        {
-            throw new TvException(
-                TvErrorCode.TvUnsupportedCapability,
-                "This TV exposes no DIAL endpoint, so a YouTube launch cannot be performed or confirmed. " +
-                "DIAL is normally advertised over SSDP on the local segment; check the TV is on the same " +
-                "segment and that network control is enabled.");
-        }
+        var (applicationUrl, status) = await ResolveYouTubeStatusAsync(
+            "This TV exposes no DIAL endpoint, so a YouTube launch cannot be performed or confirmed. " +
+            "DIAL is normally advertised over SSDP on the local segment; check the TV is on the same " +
+            "segment and that network control is enabled.",
+            ct).ConfigureAwait(false);
 
-        var status = await _dial.GetAppStatusAsync(applicationUrl, DialYouTubeApp, ct).ConfigureAwait(false);
         if (status is null || !status.Installed)
         {
             throw TvException.Unsupported("the YouTube DIAL application (it is not installed on this TV)");
@@ -832,12 +827,9 @@ public sealed class TvControlService
     /// </summary>
     private async Task<ILoungeSession> OpenReceiverAsync(CancellationToken ct)
     {
-        var applicationUrl = await _dial.ResolveApplicationUrlAsync(ct).ConfigureAwait(false)
-            ?? throw new TvException(
-                TvErrorCode.TvUnsupportedCapability,
-                "This TV exposes no DIAL endpoint, so the YouTube receiver cannot be found or controlled.");
-
-        var status = await _dial.GetAppStatusAsync(applicationUrl, DialYouTubeApp, ct).ConfigureAwait(false);
+        var (_, status) = await ResolveYouTubeStatusAsync(
+            "This TV exposes no DIAL endpoint, so the YouTube receiver cannot be found or controlled.",
+            ct).ConfigureAwait(false);
 
         if (status is null || !status.Installed)
         {
@@ -860,6 +852,49 @@ public sealed class TvControlService
         }
 
         return await ConnectLoungeAsync(screenId, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Resolves the DIAL application URL and reads YouTube's status on it. A TV reboot
+    /// can move its DIAL port, leaving the cached URL dead: when a cached, discovered
+    /// URL is unreachable and the caller has not given up, the cache is dropped and
+    /// the URL re-resolved exactly once. A 404 (not installed), any other refusal, a
+    /// configured URL or caller cancellation keeps the original outcome.
+    /// </summary>
+    private async Task<(Uri ApplicationUrl, DialAppStatus? Status)> ResolveYouTubeStatusAsync(
+        string noEndpointDetail,
+        CancellationToken ct)
+    {
+        var resolution = await _dial.ResolveApplicationUrlAsync(ct).ConfigureAwait(false)
+            ?? throw new TvException(TvErrorCode.TvUnsupportedCapability, noEndpointDetail);
+
+        try
+        {
+            var status = await _dial.GetAppStatusAsync(resolution.ApplicationUrl, DialYouTubeApp, ct)
+                .ConfigureAwait(false);
+            return (resolution.ApplicationUrl, status);
+        }
+        catch (TvException ex) when (ex.Code == TvErrorCode.TvUnreachable
+            && resolution.FromCache
+            && resolution.Strategy != DialResolutionStrategy.Configured
+            && !ct.IsCancellationRequested)
+        {
+            _dial.InvalidateApplicationUrl(resolution.ApplicationUrl);
+
+            var fresh = await _dial.ResolveApplicationUrlAsync(ct).ConfigureAwait(false);
+            if (fresh is null || fresh.ApplicationUrl == resolution.ApplicationUrl)
+            {
+                throw;
+            }
+
+            _logger.LogInformation(
+                "DIAL moved from port {StalePort} to {FreshPort}; continuing on the new port.",
+                resolution.ApplicationUrl.Port, fresh.ApplicationUrl.Port);
+
+            var status = await _dial.GetAppStatusAsync(fresh.ApplicationUrl, DialYouTubeApp, ct)
+                .ConfigureAwait(false);
+            return (fresh.ApplicationUrl, status);
+        }
     }
 
     /// <summary>Polls DIAL until the receiver reports itself running, so a screen id exists.</summary>

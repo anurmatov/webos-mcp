@@ -112,6 +112,18 @@ public sealed record DialAppStatus(
         || State.Equals("starting", StringComparison.OrdinalIgnoreCase);
 }
 
+/// <summary>How a DIAL application URL was found, in discovery order.</summary>
+public enum DialResolutionStrategy
+{
+    Configured,
+    DirectProbe,
+    UnicastSsdp,
+    MulticastSsdp,
+}
+
+/// <summary>A resolved DIAL application URL, how it was found, and whether it was served from the cache.</summary>
+public sealed record DialResolution(Uri ApplicationUrl, DialResolutionStrategy Strategy, bool FromCache);
+
 /// <summary>
 /// DIAL (DIscovery And Launch) — the third protocol this server speaks, after
 /// SSAP and Wake-on-LAN. It exists because SSAP's launcher accepts a YouTube
@@ -123,8 +135,18 @@ public interface IDialClient
     /// <summary>
     /// Resolves the TV's DIAL application URL, or null when the TV exposes no
     /// DIAL endpoint (in which case the capability is genuinely unsupported).
+    /// The result says how the URL was found and whether it came from the cache,
+    /// so a caller can tell a stale cached URL from a fresh one.
     /// </summary>
-    Task<Uri?> ResolveApplicationUrlAsync(CancellationToken cancellationToken);
+    Task<DialResolution?> ResolveApplicationUrlAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Drops a cached application URL that stopped answering, so the next
+    /// resolution rediscovers it. Compare-and-clear: the cache is cleared only if
+    /// it still holds <paramref name="stale"/>, so a newer URL cached by a
+    /// concurrent call is kept.
+    /// </summary>
+    void InvalidateApplicationUrl(Uri stale);
 
     /// <summary>
     /// Reads an application's DIAL status. Null means, and only means, the app is

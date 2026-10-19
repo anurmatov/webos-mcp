@@ -61,9 +61,11 @@ public static class Program
     private static async Task<int> RunHttpAsync(string[] args)
     {
         HttpTransportSettings settings;
+        WebApplication app;
         try
         {
             settings = HttpTransportSettings.Resolve(HttpTransportSettings.CurrentEnvironment());
+            app = HttpServerHost.Build(settings, args);
         }
         catch (HttpTransportConfigurationException ex)
         {
@@ -72,14 +74,19 @@ public static class Program
             return 78;
         }
 
-        var app = HttpServerHost.Build(settings, args);
+        var mode = (settings.UnixSocketPath is not null, settings.RequiresAuth) switch
+        {
+            (true, true) => $"unix socket mode {Convert.ToString((int)settings.UnixSocketMode, 8).PadLeft(4, '0')}, bearer token required",
+            (true, false) => $"unix socket mode {Convert.ToString((int)settings.UnixSocketMode, 8).PadLeft(4, '0')}, no token configured",
+            (false, true) => "bearer token required",
+            (false, false) => "loopback-only, no token configured",
+        };
 
-        var mode = settings.RequiresAuth
-            ? "bearer token required"
-            : "loopback-only, no token configured";
+        await HttpServerHost.StartAsync(app, settings, CancellationToken.None).ConfigureAwait(false);
         Console.Error.WriteLine($"webos-mcp listening on {settings.Url} ({mode}).");
 
-        await app.RunAsync().ConfigureAwait(false);
+        await app.WaitForShutdownAsync().ConfigureAwait(false);
+        await app.DisposeAsync().ConfigureAwait(false);
         return 0;
     }
 }

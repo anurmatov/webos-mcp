@@ -242,6 +242,16 @@ reply, and either add that port to `WEBOSMCP__DIALPORTS` or set
 `WEBOSMCP__DIALAPPLICATIONURL` to it directly. The server logs which ports it
 probed when resolution fails.
 
+**YouTube tools stopped working after the TV rebooted.**
+The TV can move its DIAL port on reboot. The server caches the resolved DIAL
+URL, and when a cached, discovered URL stops answering (connection refused or
+timeout) it drops it and resolves once more within the same call. The log then
+shows `Resolved DIAL by <strategy> on port <port>` with the new port. A
+configured `WEBOSMCP__DIALAPPLICATIONURL` is never re-resolved, so a moved port
+needs a config change there. If discovery cannot find the new port either, the
+call fails with `TV_UNREACHABLE`, and running the server with
+`network_mode: host` lets SSDP multicast replies reach it.
+
 **`tv_youtube_play` says the receiver advertises no screen id.**
 DIAL found YouTube but the status document carries no `screenId`, so there is no
 Lounge session to open. Nothing can be loaded or verified on this firmware.
@@ -264,6 +274,11 @@ a restricted or store-demo mode.
 You set a non-loopback `WEBOS_MCP_HTTP_BIND` without a token. Set
 `WEBOS_MCP_HTTP_TOKEN` / `WEBOS_MCP_HTTP_TOKEN_FILE`, or bind to `127.0.0.1`.
 This is intentional.
+
+**The server refuses to start in unix socket mode.**
+The message names the cause: `WEBOS_MCP_HTTP_BIND` or `WEBOS_MCP_HTTP_PORT` is
+also set, the mode is not `0600`/`0660`, the socket's directory is missing or
+not writable, or something other than a socket already exists at the path.
 
 **HTTP requests return `401`.**
 Send `Authorization: Bearer <token>`. If you use `WEBOS_MCP_HTTP_TOKEN_FILE`,

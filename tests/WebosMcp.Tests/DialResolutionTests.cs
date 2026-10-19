@@ -55,7 +55,7 @@ public sealed class DialResolutionTests
 
         var resolved = await client.ResolveApplicationUrlAsync(CancellationToken.None);
 
-        Assert.Equal($"http://{Host}:2038/apps/", resolved?.AbsoluteUri);
+        Assert.Equal($"http://{Host}:2038/apps/", resolved?.ApplicationUrl.AbsoluteUri);
 
         // The point of the fix: no SSDP of any kind was needed.
         Assert.Empty(ssdp.Searched);
@@ -87,7 +87,7 @@ public sealed class DialResolutionTests
 
         var resolved = await client.ResolveApplicationUrlAsync(CancellationToken.None);
 
-        Assert.Equal($"http://{Host}:2038/apps/", resolved?.AbsoluteUri);
+        Assert.Equal($"http://{Host}:2038/apps/", resolved?.ApplicationUrl.AbsoluteUri);
     }
 
     // ---- the configurable escape hatch --------------------------------------
@@ -100,7 +100,7 @@ public sealed class DialResolutionTests
 
         var resolved = await client.ResolveApplicationUrlAsync(CancellationToken.None);
 
-        Assert.Equal($"http://{Host}:9999/apps/", resolved?.AbsoluteUri);
+        Assert.Equal($"http://{Host}:9999/apps/", resolved?.ApplicationUrl.AbsoluteUri);
         Assert.Empty(http.Requested);
         Assert.Empty(ssdp.Searched);
     }
@@ -114,7 +114,7 @@ public sealed class DialResolutionTests
 
         var resolved = await client.ResolveApplicationUrlAsync(CancellationToken.None);
 
-        Assert.Equal($"http://{Host}:7000/apps/", resolved?.AbsoluteUri);
+        Assert.Equal($"http://{Host}:7000/apps/", resolved?.ApplicationUrl.AbsoluteUri);
         Assert.Equal([$"http://{Host}:7000/"], http.Requested);
     }
 
@@ -154,7 +154,7 @@ public sealed class DialResolutionTests
 
         var resolved = await client.ResolveApplicationUrlAsync(CancellationToken.None);
 
-        Assert.Equal($"http://{Host}:5000/apps/", resolved?.AbsoluteUri);
+        Assert.Equal($"http://{Host}:5000/apps/", resolved?.ApplicationUrl.AbsoluteUri);
         Assert.Equal([UnicastTarget], ssdp.Searched);
         Assert.DoesNotContain(MulticastTarget, ssdp.Searched);
     }
@@ -171,7 +171,7 @@ public sealed class DialResolutionTests
 
         var resolved = await client.ResolveApplicationUrlAsync(CancellationToken.None);
 
-        Assert.Equal($"http://{Host}:5000/apps/", resolved?.AbsoluteUri);
+        Assert.Equal($"http://{Host}:5000/apps/", resolved?.ApplicationUrl.AbsoluteUri);
         Assert.Equal([UnicastTarget, MulticastTarget], ssdp.Searched);
     }
 
@@ -220,7 +220,219 @@ public sealed class DialResolutionTests
         var probesAfterFirst = http.Requested.Count;
         var second = await client.ResolveApplicationUrlAsync(CancellationToken.None);
 
-        Assert.Equal(first, second);
+        Assert.Equal(first?.ApplicationUrl, second?.ApplicationUrl);
+        Assert.False(first?.FromCache);
+        Assert.True(second?.FromCache);
         Assert.Equal(probesAfterFirst, http.Requested.Count);
+    }
+
+    // ---- self-heal: a TV reboot moved the DIAL port --------------------------
+
+    private const int OldPort = 1700;
+    private const int NewPort = 1100;
+    private const string Video = "dQw4w9WgXcQ";
+
+    /// <summary>
+    /// A real <see cref="DialClient"/> over a TV whose DIAL port can move, with the
+    /// old port already resolved and cached, as it is after the first call of a
+    /// long-running server.
+    /// </summary>
+    private static async Task<(TestHarness Harness, MovingDialHttpHandler Tv, CountingDialClient Dial)> CachedOnOldPortAsync(
+        TimeSpan? httpTimeout = null,
+        Action<WebosMcpOptions>? configure = null)
+    {
+        var tv = new MovingDialHttpHandler(Host, OldPort);
+        var options = new WebosMcpOptions { Host = Host, DialPorts = $"{OldPort},{NewPort}" };
+        configure?.Invoke(options);
+
+        var client = new DialClient(
+            new HttpClient(tv) { Timeout = httpTimeout ?? TimeSpan.FromSeconds(30) },
+            Options.Create(options),
+            new FakeSsdpChannel(),
+            NullLogger<DialClient>.Instance);
+
+        var dial = new CountingDialClient(client);
+        var warm = await dial.ResolveApplicationUrlAsync(CancellationToken.None);
+        Assert.Equal(OldPort, warm?.ApplicationUrl.Port);
+
+        var harness = new TestHarness(dial: dial);
+        harness.Lounge.Session!.Reports.Add(new LoungeReceiverState(Video, LoungePlayerState.Playing));
+        return (harness, tv, dial);
+    }
+
+    [Fact]
+    public async Task A_refused_cached_port_is_re_resolved_once_and_play_continues()
+    {
+        var (harness, tv, dial) = await CachedOnOldPortAsync();
+        tv.CurrentPort = NewPort;
+        var before = dial.ResolveCount;
+
+        var result = await harness.Control.PlayYouTubeAsync(Video, CancellationToken.None);
+
+        Assert.True(result.ExactVideoConfirmed);
+        Assert.Equal(2, dial.ResolveCount - before);
+        Assert.Equal(NewPort, (await dial.ResolveApplicationUrlAsync(CancellationToken.None))?.ApplicationUrl.Port);
+    }
+
+    [Fact]
+    public async Task A_cached_port_that_times_out_with_a_live_caller_is_re_resolved_once()
+    {
+        var (harness, tv, dial) = await CachedOnOldPortAsync(httpTimeout: TimeSpan.FromMilliseconds(200));
+        tv.StatusByPort[OldPort] = DialPortBehaviour.Hang;
+        tv.CurrentPort = NewPort;
+        var before = dial.ResolveCount;
+
+        var result = await harness.Control.PlayYouTubeAsync(Video, CancellationToken.None);
+
+        Assert.True(result.ExactVideoConfirmed);
+        Assert.Equal(2, dial.ResolveCount - before);
+    }
+
+    [Fact]
+    public async Task Caller_cancellation_is_not_mistaken_for_a_moved_port()
+    {
+        var (harness, tv, dial) = await CachedOnOldPortAsync();
+        tv.StatusByPort[OldPort] = DialPortBehaviour.Hang;
+        tv.CurrentPort = NewPort;
+        var before = dial.ResolveCount;
+        using var cts = new CancellationTokenSource();
+
+        var play = harness.Control.PlayYouTubeAsync(Video, cts.Token);
+        await tv.HangStarted.Task;
+        await cts.CancelAsync();
+
+        var error = await Assert.ThrowsAsync<TvException>(() => play);
+        Assert.Equal(TvErrorCode.TvUnreachable, error.Code);
+        Assert.Equal(1, dial.ResolveCount - before);
+    }
+
+    [Fact]
+    public async Task A_404_on_the_cached_port_is_not_installed_and_never_re_resolves()
+    {
+        var (harness, tv, dial) = await CachedOnOldPortAsync();
+        tv.StatusByPort[OldPort] = DialPortBehaviour.NotFound;
+        var before = dial.ResolveCount;
+
+        var error = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvUnsupportedCapability, error.Code);
+        Assert.Contains("not installed", error.Message);
+        Assert.Equal(1, dial.ResolveCount - before);
+    }
+
+    [Fact]
+    public async Task A_403_on_the_cached_port_is_a_TV_error_and_never_re_resolves()
+    {
+        var (harness, tv, dial) = await CachedOnOldPortAsync();
+        tv.StatusByPort[OldPort] = DialPortBehaviour.Forbidden;
+        var before = dial.ResolveCount;
+
+        var error = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvError, error.Code);
+        Assert.Equal(1, dial.ResolveCount - before);
+    }
+
+    [Fact]
+    public async Task A_configured_url_that_is_unreachable_is_never_re_resolved()
+    {
+        var (harness, tv, dial) = await CachedOnOldPortAsync(
+            configure: o => o.DialApplicationUrl = $"http://{Host}:{OldPort}/apps/");
+        tv.CurrentPort = NewPort;
+        var before = dial.ResolveCount;
+
+        var error = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvUnreachable, error.Code);
+        Assert.Equal(1, dial.ResolveCount - before);
+    }
+
+    [Fact]
+    public async Task A_fresh_resolve_to_the_same_url_rethrows_the_original_error()
+    {
+        // Discovery still finds the old port, but its status endpoint refuses.
+        var (harness, tv, dial) = await CachedOnOldPortAsync();
+        tv.StatusByPort[OldPort] = DialPortBehaviour.Refused;
+        var before = dial.ResolveCount;
+
+        var error = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvUnreachable, error.Code);
+        Assert.Contains("Could not read DIAL status", error.Message);
+        Assert.Equal(2, dial.ResolveCount - before);
+    }
+
+    [Fact]
+    public async Task A_fresh_resolve_that_finds_nothing_rethrows_the_original_error()
+    {
+        var (harness, tv, dial) = await CachedOnOldPortAsync();
+        tv.CurrentPort = 9999; // outside the probe list, and SSDP stays silent
+        var before = dial.ResolveCount;
+
+        var error = await Assert.ThrowsAsync<TvException>(
+            () => harness.Control.PlayYouTubeAsync(Video, CancellationToken.None));
+
+        Assert.Equal(TvErrorCode.TvUnreachable, error.Code);
+        Assert.Equal(2, dial.ResolveCount - before);
+    }
+
+    [Fact]
+    public async Task The_receiver_controls_heal_a_moved_port_too()
+    {
+        var (harness, tv, dial) = await CachedOnOldPortAsync();
+        tv.CurrentPort = NewPort;
+        var before = dial.ResolveCount;
+
+        await harness.Control.YouTubeNowPlayingAsync(CancellationToken.None);
+
+        Assert.Equal(2, dial.ResolveCount - before);
+        Assert.Contains("screen-1", harness.Lounge.ConnectedScreenIds);
+    }
+
+    [Fact]
+    public async Task A_late_invalidate_does_not_drop_a_newer_cached_url()
+    {
+        var tv = new MovingDialHttpHandler(Host, OldPort);
+        var client = new DialClient(
+            new HttpClient(tv),
+            Options.Create(new WebosMcpOptions { Host = Host, DialPorts = $"{OldPort},{NewPort}" }),
+            new FakeSsdpChannel(),
+            NullLogger<DialClient>.Instance);
+
+        var stale = (await client.ResolveApplicationUrlAsync(CancellationToken.None))!.ApplicationUrl;
+        tv.CurrentPort = NewPort;
+
+        // One caller heals the cache onto the new port...
+        client.InvalidateApplicationUrl(stale);
+        var fresh = await client.ResolveApplicationUrlAsync(CancellationToken.None);
+        Assert.Equal(NewPort, fresh?.ApplicationUrl.Port);
+
+        // ...then a slower caller invalidates the same stale URL.
+        client.InvalidateApplicationUrl(stale);
+
+        var cached = await client.ResolveApplicationUrlAsync(CancellationToken.None);
+        Assert.True(cached?.FromCache);
+        Assert.Equal(NewPort, cached?.ApplicationUrl.Port);
+    }
+
+    [Fact]
+    public async Task A_resolution_reports_its_strategy_and_whether_it_was_cached()
+    {
+        var (client, _, _) = Build(new Dictionary<string, string>
+        {
+            [$"http://{Host}:2038/"] = $"http://{Host}:2038/apps/",
+        });
+
+        var first = await client.ResolveApplicationUrlAsync(CancellationToken.None);
+        var second = await client.ResolveApplicationUrlAsync(CancellationToken.None);
+
+        Assert.Equal(new DialResolution(new Uri($"http://{Host}:2038/apps/"), DialResolutionStrategy.DirectProbe, false), first);
+        Assert.Equal(first! with { FromCache = true }, second);
+        Assert.Equal("direct-probe", DialClient.StrategyName(DialResolutionStrategy.DirectProbe));
+        Assert.Equal("multicast-ssdp", DialClient.StrategyName(DialResolutionStrategy.MulticastSsdp));
     }
 }
